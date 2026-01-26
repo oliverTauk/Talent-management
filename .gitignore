@@ -1,0 +1,25 @@
+# -------------------------
+# Python caches
+# -------------------------
+__pycache__/
+*.pyc
+*.pyo
+
+# -------------------------
+# Local environments
+# -------------------------
+.conda/
+.venv/
+venv/
+env/
+
+# -------------------------
+# Secrets (DON'T COMMIT)
+# -------------------------
+.env
+.streamlit/secrets.toml
+
+# -------------------------
+VS command.txt
+
+.vscode/
