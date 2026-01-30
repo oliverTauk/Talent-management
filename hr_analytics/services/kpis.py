@@ -271,6 +271,69 @@ class KPIService:
         return out[cols] if cols else out
 
     # --------------------
+    # Manager: Performance Improvement Plan (PIP)
+    # --------------------
+    def detect_pip_header(self, df: pd.DataFrame) -> Optional[str]:
+        """Detects a column indicating PIP recommendation/assignment (Yes/No).
+
+        Prefers the confirmed phrasing from the manager sheet; falls back to headers
+        containing 'pip' or 'performance improvement plan'. Case-insensitive.
+        """
+        if df is None or df.empty:
+            return None
+        exacts = [
+            "The PIP serves as a structured tool and a planned approach used by HR and Direct Managers to aid the employee in enhancing his/her job performance for a period of 3 months.",
+            "Given that this person is at risk of low performance, I would like to enroll him/her in the Performance Improvement Plan (PIP)",
+        ]
+        for exact in exacts:
+            if exact in df.columns:
+                return exact
+        for c in df.columns:
+            lc = str(c).lower()
+            if ("pip" in lc) or ("performance improvement plan" in lc):
+                return c
+        return None
+
+    def pip_rate(self, df: pd.DataFrame, header: Optional[str] = None) -> float:
+        """Percentage (0..1) of employees with PIP=True."""
+        if df is None or df.empty:
+            return 0.0
+        if header is None:
+            header = self.detect_pip_header(df)
+        if not header:
+            return 0.0
+        return self.rate_from_boolean(df, header)
+
+    def pip_extraction(
+        self,
+        df: pd.DataFrame,
+        header: Optional[str] = None,
+        employee_col: str = "Subordinate Name",
+        manager_col: str = "Name on Mena",
+        include_cols: Optional[list] = None,
+    ) -> pd.DataFrame:
+        """Return rows where PIP=True with common columns and optional extras."""
+        if df is None or df.empty:
+            return pd.DataFrame()
+        if header is None:
+            header = self.detect_pip_header(df)
+        if not header or header not in df.columns:
+            return pd.DataFrame()
+        b = self.normalize_bool_series(df[header])
+        flagged = df[b == True].copy()
+        if flagged.empty:
+            return pd.DataFrame()
+        cols = []
+        for c in [employee_col, manager_col, "Company Name / Department", header]:
+            if c in flagged.columns and c not in cols:
+                cols.append(c)
+        if include_cols:
+            for c in include_cols:
+                if c in flagged.columns and c not in cols:
+                    cols.append(c)
+        return flagged[cols] if cols else flagged
+
+    # --------------------
     # Employee-level view from Manager 'At Risk'
     # --------------------
     def unique_employees_at_risk_count(

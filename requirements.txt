@@ -3,3 +3,5 @@ openpyxl
 streamlit
 numpy
 python-pptx
+vaderSentiment
+matplotlib
