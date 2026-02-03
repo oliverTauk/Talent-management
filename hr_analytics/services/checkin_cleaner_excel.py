@@ -40,9 +40,14 @@ class CheckInExcelCleaner:
             return None
 
         email_c = find_exact_or_contains(
-            ['email', 'email address', 'work email', 'work e-mail', 'corporate email', 'company email'],
-            fallback_contains='email',
-        )
+        [
+            'email', 'e mail', 'e-mail',
+            'email address', 'work email', 'work e-mail',
+            'corporate email', 'company email'
+        ],
+        fallback_contains='mail',   # ✅ catches "e mail"
+    )
+
         emp_name_c = find_exact_or_contains(
             ['employee name', 'employe name', 'name', 'employee']
         )

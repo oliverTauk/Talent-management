@@ -581,6 +581,55 @@ def _load_and_clean_year_from_data(year: int) -> tuple[pd.DataFrame, pd.DataFram
 # ============================================================
 # Shared helpers
 # ============================================================
+def _download_fig_png(fig, filename: str, key: str):
+    if fig is None:
+        st.caption("No chart to download.")
+        return
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
+    buf.seek(0)
+    st.download_button(
+        label="⬇️ Download Chart (PNG)",
+        data=buf,
+        file_name=filename,
+        mime="image/png",
+        use_container_width=True,
+        key=key,
+    )
+
+
+def _download_df_csv(df: pd.DataFrame, filename: str, key: str):
+    """Download a dataframe as CSV."""
+    if df is None or df.empty:
+        st.caption("No data to download.")
+        return
+    st.download_button(
+        label="⬇️ Download CSV",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name=filename,
+        mime="text/csv",
+        use_container_width=True,
+        key=key,
+    )
+
+def _download_fig_png(fig, filename: str, key: str):
+    """Download a matplotlib figure as PNG."""
+    if fig is None:
+        st.caption("No chart to download.")
+        return
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
+    buf.seek(0)
+    st.download_button(
+        label="⬇️ Download Chart (PNG)",
+        data=buf,
+        file_name=filename,
+        mime="image/png",
+        use_container_width=True,
+        key=key,
+    )
+
+
 RES_ORDER = [
     "Enrolling in the group's wellness sessions",
     "Seeking advice from HR",
@@ -1492,7 +1541,8 @@ if "yoy_ready" not in st.session_state:
 
 # Back button (always visible)
 if st.button("⬅ Back to Home"):
-    st.switch_page("Home.py")  # change back to streamlit_app.py if you didn't rename
+    st.switch_page("Home.py")
+  # change back to streamlit_app.py if you didn't rename
 
 
 # ============================================================
@@ -1661,6 +1711,8 @@ def _analysis_ui(df_raw: pd.DataFrame, who: str, year: int | None = None):
                 counts.columns = ["Reason", "Count"]
                 counts["% of Yes responders"] = (counts["Count"] / counts["Count"].sum() * 100).round(1)
                 st.dataframe(counts, use_container_width=True, hide_index=True)
+                _download_df_csv(counts, "hr_pulse_reasons_breakdown.csv", key="dl_hr_pulse_reasons")
+
             else:
                 st.info("Reason column exists but contains no selections.")
 
@@ -1709,9 +1761,12 @@ def _analysis_ui(df_raw: pd.DataFrame, who: str, year: int | None = None):
             col1, col2 = st.columns([1.2, 0.8])
             with col1:
                 section_title("Recurring topics (with sentiment)")
-                st.dataframe(_topic_summary_with_sentiment(texts), use_container_width=True, hide_index=True)
+                df_topics = _topic_summary_with_sentiment(texts)
+                st.dataframe(df_topics, use_container_width=True, hide_index=True)
+                _download_df_csv(df_topics, "reasons_for_no_topics_sentiment.csv", key="dl_no_topics_sentiment")
 
                 divider()
+
                 section_title("Action plan (Themes → Suggested actions)")
 
                 plan_df = _reasons_action_plan(texts)
@@ -1720,6 +1775,7 @@ def _analysis_ui(df_raw: pd.DataFrame, who: str, year: int | None = None):
                     st.info("No clear themes detected to generate an action plan.")
                 else:
                     st.dataframe(plan_df, use_container_width=True, hide_index=True)
+                    _download_df_csv(plan_df, "reasons_for_no_action_plan.csv", key="dl_no_action_plan")
 
                     st.markdown("**Top priorities (quick view):**")
                     for _, r in plan_df.head(3).iterrows():
@@ -1727,7 +1783,10 @@ def _analysis_ui(df_raw: pd.DataFrame, who: str, year: int | None = None):
 
             with col2:
                 section_title("Top keywords")
-                st.dataframe(_top_keywords(texts, top_n=25), use_container_width=True, hide_index=True)
+                df_kw = _top_keywords(texts, top_n=25)
+                st.dataframe(df_kw, use_container_width=True, hide_index=True)
+                _download_df_csv(df_kw, "reasons_for_no_top_keywords.csv", key="dl_no_top_keywords")
+
         else:
             st.info("No elaboration text found for employees who answered 'No'.")
     else:
@@ -1794,10 +1853,15 @@ def _analysis_ui(df_raw: pd.DataFrame, who: str, year: int | None = None):
     col1, col2 = st.columns([1.2, 0.8])
     with col1:
         section_title("Recurring topics (with sentiment)")
-        st.dataframe(_topic_summary_with_sentiment(row_texts), use_container_width=True, hide_index=True)
+        df_topics = _topic_summary_with_sentiment(row_texts)
+        st.dataframe(df_topics, use_container_width=True, hide_index=True)
+        _download_df_csv(df_topics, "recurring_topics_sentiment.csv", key="dl_topics_sentiment")
+
     with col2:
         section_title("Top keywords")
-        st.dataframe(_top_keywords(row_texts, top_n=25), use_container_width=True, hide_index=True)
+        df_keywords = _top_keywords(row_texts, top_n=25)
+        st.dataframe(df_keywords, use_container_width=True, hide_index=True)
+        _download_df_csv(df_keywords, "top_keywords.csv", key="dl_top_keywords")
 
 
 # ============================================================
@@ -1806,15 +1870,7 @@ def _analysis_ui(df_raw: pd.DataFrame, who: str, year: int | None = None):
 if section == "KPIs":
 
     section_title("KPIs")
-    if st.session_state.clean_ready:
-        if st.button("🔄 Re-run"):
-            st.session_state.clean_ready = False
-            st.session_state.clean_error = None
-            st.session_state.cleaned_emp = None
-            st.session_state.cleaned_mgr = None
-            st.session_state.combined = None
-            st.rerun()
-
+        
     divider()
 
     with st.expander("Upload / Data settings", expanded=not st.session_state.clean_ready):
@@ -1920,27 +1976,49 @@ if section == "KPIs":
         cleaned_emp = st.session_state.cleaned_emp
         cleaned_mgr = st.session_state.cleaned_mgr
 
-        # --- Department filter ---
+        # ---- Add Year column first (safe even if Timestamp missing) ----
+        cleaned_emp = _add_year_from_timestamp(cleaned_emp)
+        cleaned_mgr = _add_year_from_timestamp(cleaned_mgr)
+
+        # Build year options
+        year_options = ["All years"]
+        emp_years = sorted([int(y) for y in cleaned_emp["Year"].dropna().unique()]) if "Year" in cleaned_emp.columns else []
+        mgr_years = sorted([int(y) for y in cleaned_mgr["Year"].dropna().unique()]) if "Year" in cleaned_mgr.columns else []
+        year_options += sorted(set(emp_years) | set(mgr_years))
+
+        # Department options
         dept_choices = _dept_options(cleaned_emp, cleaned_mgr)
-        selected_dept = st.selectbox(
-            "Filter by department",
-            options=dept_choices,
-            index=0,
-            key="kpi_dept_filter"
-        )
 
-        emp_dept_col = _find_dept_col(cleaned_emp)
-        mgr_dept_col = _find_dept_col(cleaned_mgr)
+        # UI: Year + Department side-by-side
+        c_year, c_dept = st.columns(2)
+        with c_year:
+            selected_year = st.selectbox("Filter by year", options=year_options, index=0, key="kpi_year_filter")
+        with c_dept:
+            selected_dept = st.selectbox("Filter by department", options=dept_choices, index=0, key="kpi_dept_filter")
 
-        emp_f = _filter_by_dept(cleaned_emp, emp_dept_col, selected_dept)
-        mgr_f = _filter_by_dept(cleaned_mgr, mgr_dept_col, selected_dept)
+        # Apply Year filter first
+        def _filter_by_year(df: pd.DataFrame, year_sel):
+            if df is None or df.empty or year_sel == "All years" or "Year" not in df.columns:
+                return df
+            return df[df["Year"] == year_sel].copy()
+
+        emp_tmp = _filter_by_year(cleaned_emp, selected_year)
+        mgr_tmp = _filter_by_year(cleaned_mgr, selected_year)
+
+        # Then apply Department filter
+        emp_dept_col = _find_dept_col(emp_tmp)
+        mgr_dept_col = _find_dept_col(mgr_tmp)
+
+        emp_f = _filter_by_dept(emp_tmp, emp_dept_col, selected_dept)
+        mgr_f = _filter_by_dept(mgr_tmp, mgr_dept_col, selected_dept)
 
         divider()
         section_title("Completion Rate (manual inputs)")
 
         # Make keys unique per year+dept view so it doesn't mix inputs
-        ctx = selected_dept if "selected_dept" in locals() else "All"
+        ctx = f"{selected_year}_{selected_dept}"
         ctx_key = re.sub(r"[^a-zA-Z0-9_]", "_", str(ctx))
+
 
         cA, cB = st.columns(2)
 
@@ -2041,7 +2119,9 @@ if section == "KPIs":
                         reasons = emp_f.loc[no, elab_col].dropna().astype(str).map(_clean_text)
                         reasons = [r for r in reasons.tolist() if r.strip()]
                         if reasons:
-                            st.dataframe(_top_keywords(reasons, top_n=15), use_container_width=True, hide_index=True)
+                            df_kw = _top_keywords(reasons, top_n=15)
+                            st.dataframe(df_kw, use_container_width=True, hide_index=True)
+                            _download_df_csv(df_kw, "alignment_no_reasons_top_keywords.csv", key="dl_align_no_keywords")
 
 
             divider()
@@ -2114,7 +2194,9 @@ if section == "KPIs":
                             "• Rarely give chances to advance",
                             fontsize=11, va="top")
 
-                    st.pyplot(fig, clear_figure=True)
+                    st.pyplot(fig, clear_figure=False)
+                    _download_fig_png(fig, "slide12_managers_behaviors.png", key="dl_slide12_behaviors_png")
+
 
             divider()
             section_title("Work Culture and Environment — Supportive Work Environment (Slide 20)")
@@ -2149,6 +2231,7 @@ if section == "KPIs":
                 {"Response": "NO",  "Employees": no_count},
                 ])
                 st.dataframe(env_summary, use_container_width=True, hide_index=True)
+                _download_df_csv(env_summary, "supportive_work_environment_summary.csv", key="dl_supportive_env_summary")
 
 
                 # Names of employees who answered NO
@@ -2172,7 +2255,6 @@ if section == "KPIs":
                 counts = _dynamics_counts(emp_f[dyn_col])
 
                 # Horizontal bar chart like PPT
-                import numpy as np
                 labels = DYNAMICS_ORDER
                 values = [int(counts.get(k, 0)) for k in labels]
                 y = np.arange(len(labels))
@@ -2188,89 +2270,91 @@ if section == "KPIs":
                 for i, v in enumerate(values):
                     ax.text(v + 0.1, i, str(int(v)), va="center")
 
-                st.pyplot(fig, clear_figure=True)
+                st.pyplot(fig, clear_figure=False)
+                _download_fig_png(fig, "slide21_employee_dynamics.png", key="dl_slide21_emp_dyn_png")
 
 
             divider()
-            section_title("Stress Frequency — Employees (Slide 23)")
+            with st.expander("Stress — Employees (Slide 23)", expanded=True):
+                tab1, tab2 = st.tabs(["Frequency", "Reasons (Who mentioned what)"])
 
-            freq_col = _find_stress_freq_col_emp(emp_f)
-            reason_col = _find_stress_reason_col_emp(emp_f)  # optional
+                # -------------------------
+                # Tab 1: Stress Frequency
+                # -------------------------
+                with tab1:
+                    freq_col = _find_stress_freq_col_emp(emp_f)
+                    reason_col_freq = _find_stress_reason_col_emp(emp_f)  # optional (keywords under buckets)
 
-            if not freq_col:
-                st.info("Could not detect the employee stress frequency question in employee data.")
-            else:
-                tmp = emp_f.copy()
-                tmp["_stress_freq"] = tmp[freq_col].astype(str).map(_norm_stress_freq)
+                    if not freq_col:
+                        st.info("Could not detect the employee stress frequency question in employee data.")
+                    else:
+                        tmp = emp_f.copy()
+                        tmp["_stress_freq"] = tmp[freq_col].astype(str).map(_norm_stress_freq)
 
-                # Counts
-                counts = tmp["_stress_freq"].value_counts().reindex(STRESS_FREQ_ORDER, fill_value=0)
+                        counts = tmp["_stress_freq"].value_counts().reindex(STRESS_FREQ_ORDER, fill_value=0)
 
-                c1, c2, c3 = st.columns(3)
+                        c1, c2, c3 = st.columns(3)
 
-                # Helper to show top 3 reasons (keywords)
-                def top3_reasons(texts: list[str]) -> str:
-                    if not texts:
-                        return ""
-                    kw = _top_keywords(texts, top_n=3)  # you already have _top_keywords()
-                    if kw.empty:
-                        return ""
-                    return "\n".join(kw["Keyword"].tolist())
+                        def top3_reasons(texts: list[str]) -> str:
+                            if not texts:
+                                return ""
+                            kw = _top_keywords(texts, top_n=3)
+                            if kw.empty:
+                                return ""
+                            return ", ".join(kw["Keyword"].tolist())
 
-                for col_ui, label in zip([c1, c2, c3], STRESS_FREQ_ORDER):
-                    with col_ui:
-                        st.subheader(label.upper())
-                        st.metric("Employees", int(counts[label]))
+                        for col_ui, label in zip([c1, c2, c3], STRESS_FREQ_ORDER):
+                            with col_ui:
+                                st.subheader(label.upper())
+                                st.metric("Employees", int(counts[label]))
 
-                        if reason_col and reason_col in tmp.columns:
-                            texts = tmp.loc[tmp["_stress_freq"] == label, reason_col].dropna().astype(str).map(_clean_text)
-                            texts = [t for t in texts.tolist() if t.strip()]
-                            if texts:
-                                st.caption(top3_reasons(texts))
-                            else:
-                                st.caption("")  # no reasons available
+                                if reason_col_freq and reason_col_freq in tmp.columns:
+                                    texts = tmp.loc[tmp["_stress_freq"] == label, reason_col_freq].dropna().astype(str).map(_clean_text)
+                                    texts = [t for t in texts.tolist() if t.strip()]
+                                    if texts:
+                                        st.caption(top3_reasons(texts))
 
-            divider()
-            section_title("Reasons Behind Employees’ Stress (Who mentioned what)")
+                # -------------------------
+                # Tab 2: Reasons table
+                # -------------------------
+                with tab2:
+                    reason_col = _find_emp_stress_reasons_col(emp_f)
+                    name_col = "Your Name"
 
-            reason_col = _find_emp_stress_reasons_col(emp_f)
-            name_col = "Your Name"
+                    if not reason_col:
+                        st.info("Could not detect the stress reasons multi-select question in employee data.")
+                    elif name_col not in emp_f.columns:
+                        st.info("Employee name column 'Your Name' not found in employee data.")
+                    else:
+                        reason_to_names: dict[str, set[str]] = {k: set() for k in EMP_STRESS_REASON_ORDER}
 
-            if not reason_col:
-                st.info("Could not detect the stress reasons multi-select question in employee data.")
-            elif name_col not in emp_f.columns:
-                st.info("Employee name column 'Your Name' not found in employee data.")
-            else:
-                # Build mapping: reason -> set(names)
-                reason_to_names: dict[str, set[str]] = {k: set() for k in EMP_STRESS_REASON_ORDER}
+                        for _, r in emp_f[[name_col, reason_col]].iterrows():
+                            emp_name = str(r[name_col]).strip()
+                            if not emp_name:
+                                continue
 
-                for _, r in emp_f[[name_col, reason_col]].iterrows():
-                    emp_name = str(r[name_col]).strip()
-                    if not emp_name:
-                        continue
+                            picks = _split_multiselect(r[reason_col])
+                            for p in picks:
+                                k = _norm_emp_stress_reason(p)
+                                if k:
+                                    reason_to_names[k].add(emp_name)
 
-                    picks = _split_multiselect(r[reason_col])
-                    for p in picks:
-                        k = _norm_emp_stress_reason(p)
-                        if k:
-                            reason_to_names[k].add(emp_name)
+                        rows = []
+                        for reason in EMP_STRESS_REASON_ORDER:
+                            names = sorted(reason_to_names.get(reason, set()))
+                            if not names:
+                                continue
+                            rows.append({
+                                "Reason": reason,
+                                "Employees who mentioned it": ", ".join(names)
+                            })
 
-                # Build ONE table
-                rows = []
-                for reason in EMP_STRESS_REASON_ORDER:
-                    names = sorted(reason_to_names.get(reason, set()))
-                    if not names:
-                        continue
-                    rows.append({
-                        "Reason": reason,
-                        "Employees who mentioned it": ", ".join(names)  # line breaks inside the cell
-                    })
-
-                if rows:
-                    df_out = pd.DataFrame(rows)
-                    st.dataframe(df_out, use_container_width=True, hide_index=True)
-                else:
-                    st.caption("No reasons were selected.")
+                        if rows:
+                            df_out = pd.DataFrame(rows)
+                            st.dataframe(df_out, use_container_width=True, hide_index=True)
+                            _download_df_csv(df_out, "stress_reasons_who_mentioned.csv", key="dl_stress_reasons_table")
+                        else:
+                            st.caption("No reasons were selected.")
 
 
             divider()
@@ -2647,7 +2731,8 @@ if section == "KPIs":
                 for i, v in enumerate(values):
                     ax.text(v + 0.1, i, str(int(v)), va="center")
 
-                st.pyplot(fig, clear_figure=True)
+                st.pyplot(fig, clear_figure=False)
+                _download_fig_png(fig, "slide22_manager_dynamics.png", key="dl_slide22_mgr_dyn_png")
 
 
             divider()
@@ -2808,7 +2893,8 @@ if section == "KPIs":
                     for i, v in enumerate(mgr_counts.values):
                         ax.text(v + 0.05, i - 0.2, str(int(v)), va="center")
 
-                    st.pyplot(fig, clear_figure=True)
+                    st.pyplot(fig, clear_figure=False)
+                    _download_fig_png(fig, "slide11_job_changes_types.png", key="dl_slide11_job_changes_png")
 
                 divider()
                 section_title("Adapting to Change (Employee vs Manager)")
@@ -2905,7 +2991,7 @@ if section == "KPIs":
                     mgr_pct = _pct_series(mgr_freq)
 
                     # Chart: grouped horizontal bars (Managers vs Employees) per category
-                    import numpy as np
+    
                     y = np.arange(len(FREQ_CATS))
                     h = 0.35
 
@@ -2918,7 +3004,8 @@ if section == "KPIs":
                     ax.set_xlabel("% of responses")
                     ax.set_title("Check-ins meeting frequency (2025)")
                     ax.legend()
-                    st.pyplot(fig, clear_figure=True)
+                    st.pyplot(fig, clear_figure=False)
+                    _download_fig_png(fig, "checkins_meeting_frequency.png", key="dl_meeting_freq_png")
 
                     # Misalignments (needs names)
                     divider()
@@ -2979,6 +3066,7 @@ if section == "KPIs":
                     })
 
                     st.dataframe(table_df, use_container_width=True, hide_index=True)
+                    _download_df_csv(table_df, "reward_recognition_employee_vs_manager.csv", key="dl_reward_recognition_table")
 
                     # Top 3 bullets (employees)
                     st.markdown("**Based on employees’ feedback, the 3 most common used methods of recognition by managers are:**")
@@ -3078,7 +3166,9 @@ if section == "KPIs":
                     for i, v in enumerate(emp_counts.values):
                         ax.text(i + w/2, v + 0.1, str(int(v)), ha="center", va="bottom", fontsize=9)
 
-                    st.pyplot(fig, clear_figure=True)
+                    st.pyplot(fig, clear_figure=False)
+                    _download_fig_png(fig, "slide17_mistakes_employee_vs_manager.png", key="dl_slide17_mistakes_png")
+
 
                     divider()
 

@@ -1,151 +1,233 @@
 import streamlit as st
 
+# -------------------------------------------------------------------
+# Global Design System (one place for whole app)
+# -------------------------------------------------------------------
+
 def apply_global_style():
     st.markdown(
         """
         <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-
+        /* ---------------------------
+           App background + typography
+        --------------------------- */
         html, body, [class*="css"]  {
-            font-family: 'Inter', sans-serif !important;
+            font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
         }
 
+        .stApp {
+            background: linear-gradient(180deg, #f7f9fc 0%, #ffffff 40%, #ffffff 100%);
+        }
+
+        /* ---------------------------
+           Sidebar
+        --------------------------- */
+        section[data-testid="stSidebar"] {
+            background: #0b1220;
+            border-right: 1px solid rgba(255,255,255,0.06);
+        }
+        section[data-testid="stSidebar"] * {
+            color: #e5e7eb !important;
+        }
+        section[data-testid="stSidebar"] .stMarkdown,
+        section[data-testid="stSidebar"] label,
+        section[data-testid="stSidebar"] p {
+            color: #e5e7eb !important;
+        }
+        section[data-testid="stSidebar"] input,
+        section[data-testid="stSidebar"] select,
+        section[data-testid="stSidebar"] textarea {
+            background: rgba(255,255,255,0.06) !important;
+            border: 1px solid rgba(255,255,255,0.10) !important;
+            border-radius: 12px !important;
+            color: #e5e7eb !important;
+        }
+
+        /* ---------------------------
+           Page spacing
+        --------------------------- */
         .block-container {
-            padding-top: 2.2rem !important;
-            padding-bottom: 2.0rem !important;
+            padding-top: 3.5rem;  
+            padding-bottom: 2rem;
             max-width: 1200px;
         }
 
-        .tm-header {
-            display:flex;
-            align-items:flex-end;
-            justify-content:space-between;
-            margin: 0.25rem 0 1.25rem 0;
+        /* ---------------------------
+           Cards (we use these in helpers)
+        --------------------------- */
+        .hr-card {
+            background: rgba(255,255,255,0.85);
+            border: 1px solid rgba(15, 23, 42, 0.08);
+            border-radius: 18px;
+            padding: 16px 16px 14px 16px;
+            box-shadow: 0 12px 30px rgba(15, 23, 42, 0.06);
         }
-        .tm-title {
-            font-size: 1.75rem;
-            font-weight: 700;
-            letter-spacing: -0.02em;
-            color: #0F172A;
-            line-height: 1.2;
-        }
-        .tm-subtitle {
-            margin-top: 0.25rem;
-            font-size: 0.98rem;
-            color: #475569;
-            font-weight: 500;
+        .hr-card + .hr-card {
+            margin-top: 12px;
         }
 
-        .tm-section {
-            margin-top: 1rem;
-            margin-bottom: 0.6rem;
-            font-size: 1.15rem;
-            font-weight: 700;
-            color: #0F172A;
-        }
-        .tm-divider {
-            height: 1px;
-            background: #E5E7EB;
-            margin: 1.0rem 0;
-        }
-
-        .tm-card {
-            border: 1px solid #E5E7EB;
-            border-radius: 16px;
-            padding: 16px 16px;
-            background: #FFFFFF;
-            box-shadow: 0 8px 20px rgba(15, 23, 42, 0.06);
-        }
-        .tm-card-title {
-            font-size: 1.1rem;
-            font-weight: 700;
+        /* ---------------------------
+           Section titles
+        --------------------------- */
+        .hr-title {
+            font-size: 1.25rem;
+            font-weight: 800;
+            color: #0f172a;
             margin: 0 0 6px 0;
-            color:#0F172A;
         }
-        .tm-card-desc {
-            margin: 0;
-            color: #475569;
+        .hr-subtitle {
             font-size: 0.95rem;
-            font-weight: 500;
-            line-height: 1.35;
+            color: rgba(15,23,42,0.70);
+            margin: 0;
+        }
+        .hr-section {
+            margin-top: 18px;
+            margin-bottom: 8px;
+            font-weight: 800;
+            font-size: 1.05rem;
+            color: #0f172a;
         }
 
-        .stButton > button {
-            width: 100%;
-            border-radius: 12px !important;
-            padding: 0.65rem 0.9rem !important;
-            font-weight: 700 !important;
-            border: 1px solid #E5E7EB !important;
-        }
-        .stButton > button:hover {
-            border-color: #CBD5E1 !important;
+        .hr-subsection {
+            margin-top: 10px;
+            margin-bottom: 6px;
+            font-weight: 800;
+            font-size: 0.92rem;      /* ✅ smaller */
+            color: rgba(15,23,42,0.80);
         }
 
-        div[data-testid="stMetric"]{
-            background: #FFFFFF;
-            border: 1px solid #E5E7EB;
-            padding: 14px 14px;
+        /* ---------------------------
+           Divider
+        --------------------------- */
+        .hr-divider {
+            height: 1px;
+            background: rgba(15,23,42,0.10);
+            margin: 18px 0;
+        }
+
+        /* ---------------------------
+           Buttons
+        --------------------------- */
+        .stButton button {
+            border-radius: 14px;
+            padding: 10px 14px;
+            border: 1px solid rgba(15,23,42,0.12);
+            background: #0f172a;
+            color: #ffffff;
+            font-weight: 700;
+        }
+        .stButton button:hover {
+            border-color: rgba(15,23,42,0.18);
+            filter: brightness(1.05);
+        }
+        .stButton button:active {
+            transform: translateY(1px);
+        }
+
+        /* Primary button style (Streamlit type="primary") */
+        button[kind="primary"] {
+            background: linear-gradient(135deg, #2563eb 0%, #4f46e5 100%) !important;
+            border: none !important;
+        }
+
+        /* ---------------------------
+           Metrics
+        --------------------------- */
+        [data-testid="stMetric"] {
+            background: rgba(255,255,255,0.85);
+            border: 1px solid rgba(15,23,42,0.08);
+            border-radius: 18px;
+            padding: 12px 14px;
+            box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
+        }
+        [data-testid="stMetricLabel"] {
+            color: rgba(15,23,42,0.75);
+            font-weight: 700;
+        }
+        [data-testid="stMetricValue"] {
+            color: #0f172a;
+            font-weight: 900;
+        }
+
+        /* ---------------------------
+           Expanders
+        --------------------------- */
+        details {
+            background: rgba(255,255,255,0.70);
+            border: 1px solid rgba(15, 23, 42, 0.08);
             border-radius: 16px;
-            box-shadow: 0 8px 20px rgba(15, 23, 42, 0.05);
+            padding: 8px 10px;
+            box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);
         }
-        div[data-testid="stMetric"] label {
-            color: #475569 !important;
-            font-weight: 700 !important;
-        }
-        div[data-testid="stMetricValue"]{
-            color:#0F172A !important;
-            font-weight: 800 !important;
+        details summary {
+            font-weight: 800;
+            color: #0f172a;
         }
 
-        section[data-testid="stSidebar"] {
-            background: #FFFFFF;
-            border-right: 1px solid #E5E7EB;
+        /* ---------------------------
+           Dataframes / tables
+        --------------------------- */
+        .stDataFrame {
+            background: rgba(255,255,255,0.85);
+            border: 1px solid rgba(15, 23, 42, 0.08);
+            border-radius: 16px;
+            padding: 6px;
+            box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);
         }
 
-        .stTextInput input, .stSelectbox div, .stFileUploader, .stNumberInput input {
-            border-radius: 12px !important;
+        /* ---------------------------
+           Captions
+        --------------------------- */
+        .hr-note {
+            color: rgba(15,23,42,0.65);
+            font-size: 0.9rem;
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
+
 def page_header(title: str, subtitle: str | None = None):
-    if subtitle:
-        st.markdown(
-            f"""
-            <div class="tm-header">
-              <div>
-                <div class="tm-title">{title}</div>
-                <div class="tm-subtitle">{subtitle}</div>
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            f"""
-            <div class="tm-header">
-              <div class="tm-title">{title}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-def section_title(text: str):
-    st.markdown(f"<div class='tm-section'>{text}</div>", unsafe_allow_html=True)
-
-def divider():
-    st.markdown("<div class='tm-divider'></div>", unsafe_allow_html=True)
-
-def card(title: str, desc: str):
+    """Top header card."""
     st.markdown(
         f"""
-        <div class="tm-card">
-          <div class="tm-card-title">{title}</div>
-          <p class="tm-card-desc">{desc}</p>
+        <div class="hr-card">
+            <div class="hr-title">{title}</div>
+            {"<div class='hr-subtitle'>" + subtitle + "</div>" if subtitle else ""}
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+
+def section_title(text: str):
+    """Consistent section title."""
+    st.markdown(f"<div class='hr-section'>{text}</div>", unsafe_allow_html=True)
+
+
+def divider():
+    """Soft divider."""
+    st.markdown("<div class='hr-divider'></div>", unsafe_allow_html=True)
+
+
+def note(text: str):
+    st.markdown(f"<div class='hr-note'>{text}</div>", unsafe_allow_html=True)
+
+
+def card(title: str | None = None, body: str | None = None):
+    """Simple card container used by Home.py."""
+    st.markdown(
+        f"""
+        <div class="hr-card">
+            {f"<div class='hr-title' style='font-size:1.05rem'>{title}</div>" if title else ""}
+            {f"<div class='hr-subtitle'>{body}</div>" if body else ""}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def subsection_title(text: str):
+    st.markdown(f"<div class='hr-subsection'>{text}</div>", unsafe_allow_html=True)
+
