@@ -565,7 +565,8 @@ def _load_and_clean_year_from_data(year: int) -> tuple[pd.DataFrame, pd.DataFram
     def _read_any(p: Path) -> pd.DataFrame:
         if p.suffix.lower() == ".csv":
             return pd.read_csv(str(p))
-        return pd.read_excel(str(p))
+        return pd.read_excel(str(p), engine="openpyxl")
+
 
     emp_raw = _read_any(by_year[year]["emp"])
     mgr_raw = _read_any(by_year[year]["mgr"])
@@ -1556,7 +1557,10 @@ def _load_static_mena() -> pd.DataFrame:
     def _read_any(p: Path) -> pd.DataFrame:
         if p.suffix.lower() == ".csv":
             return pd.read_csv(str(p))
-        return pd.read_excel(str(p))
+        else:
+            return pd.read_excel(str(p), engine="openpyxl")
+
+
 
     # ✅ Force this exact file name (place it inside Data/)
     forced = base / "Data" / "Mena Report - Copy Tech.xlsx"
