@@ -86,13 +86,26 @@ TOPIC_BUCKETS: dict[str, list[str]] = {
 # ============================================================
 
 
-def _find_aligned_goals_col(df: pd.DataFrame) -> str | None:
-    return _find_col_by_keywords(df, ["aware", "aligned", "manager", "department", "goal"]) or \
-        _find_col_by_keywords(df, ["aligned", "department", "goals"])
+def _make_col_finder(*keyword_sets):
+    """Factory to create column finder functions with fallback keyword sets."""
+    def finder(df: pd.DataFrame) -> str | None:
+        for keywords in keyword_sets:
+            col = _find_col_by_keywords(df, keywords)
+            if col:
+                return col
+        return None
+    return finder
 
-def _find_if_no_elaborate_col(df: pd.DataFrame) -> str | None:
-    # generic but safe enough for this question
-    return _find_col_by_keywords(df, ["if", "no", "elaborate"]) or _find_col_by_keywords(df, ["if", "no", "please", "elaborate"])
+# Column finders using factory pattern
+_find_aligned_goals_col = _make_col_finder(
+    ["aware", "aligned", "manager", "department", "goal"],
+    ["aligned", "department", "goals"]
+)
+
+_find_if_no_elaborate_col = _make_col_finder(
+    ["if", "no", "elaborate"],
+    ["if", "no", "please", "elaborate"]
+)
 
 
 
@@ -416,6 +429,43 @@ def _looks_like_yesno(series: pd.Series) -> bool:
     denom = max(int(non_empty.sum()), 1)
     return int(valid.sum()) / denom >= 0.6
 
+def _count_yes_no(df: pd.DataFrame, col: str) -> tuple[int, int, float, float]:
+    """Returns (yes_count, no_count, yes_pct, no_pct) for a yes/no column."""
+    if not col or col not in df.columns:
+        return 0, 0, 0.0, 0.0
+    yes_mask = _yes_mask(df[col])
+    no_mask = _no_mask(df[col])
+    yes_count = int(yes_mask.sum())
+    no_count = int(no_mask.sum())
+    total = yes_count + no_count
+    yes_pct = (yes_count / total * 100) if total > 0 else 0.0
+    no_pct = (no_count / total * 100) if total > 0 else 0.0
+    return yes_count, no_count, yes_pct, no_pct
+
+def _looks_like_scale_1_5(series: pd.Series) -> bool:
+    """Check if a series looks like a 1-5 scale rating."""
+    if series is None or len(series) == 0:
+        return False
+    numeric = pd.to_numeric(series, errors='coerce')
+    non_null = numeric.dropna()
+    if len(non_null) == 0:
+        return False
+    # Check if most values are between 1 and 5
+    in_range = non_null.between(1, 5)
+    return int(in_range.sum()) / len(non_null) >= 0.6
+
+def _safe_percentage(numerator: int, denominator: int) -> float:
+    """Safely calculate percentage, returning 0 if denominator is 0."""
+    return (numerator / denominator * 100) if denominator > 0 else 0.0
+
+def _display_yes_no_metrics(df: pd.DataFrame, col: str, yes_label: str = "YES", no_label: str = "NO"):
+    """Display yes/no metrics in two columns with counts and percentages."""
+    yes_count, no_count, yes_pct, no_pct = _count_yes_no(df, col)
+    c1, c2 = st.columns(2)
+    c1.metric(yes_label, yes_count, f"{yes_pct:.1f}%")
+    c2.metric(no_label, no_count, f"{no_pct:.1f}%")
+    return yes_count, no_count
+
 # ============================================================
 # KPI metrics aggregator
 # ============================================================
@@ -447,8 +497,10 @@ def _find_dept_col(df: pd.DataFrame) -> str | None:
         return None
     # Prefer exact label if present
     for c in df.columns:
-        lc = str(c).strip().lower().replace("\\", "/")
-        if lc == "company name / department" or lc == "company name/department":
+        lc_raw = str(c)
+        lc = re.sub(r"\s+", " ", lc_raw).strip().lower().replace("\\", "/")
+        lc_nospace = lc.replace(" ", "")
+        if lc == "company name / department" or lc == "company name/department" or lc_nospace == "companyname/department":
             return c
     # Fallback: any header containing both tokens
     for c in df.columns:
@@ -473,11 +525,53 @@ def _dept_options(*dfs: pd.DataFrame) -> list[str]:
     for df in dfs:
         if df is None or df.empty:
             continue
-        c = _find_dept_col(df)
+        # Prefer explicit known headers
+        c = None
+        if "Company Name / Department" in df.columns:
+            c = "Company Name / Department"
+        elif "Company Name/Department" in df.columns:
+            c = "Company Name/Department"
+        else:
+            c = _find_dept_col(df)
+
+        # Broader token-based detection as last resort
+        if not c:
+            for col in df.columns:
+                norm_col = re.sub(r"[^a-z]+", " ", str(col).lower())
+                if "company" in norm_col and "department" in norm_col:
+                    c = col
+                    break
+
         if c:
             vals |= set(df[c].dropna().astype(str).map(_norm_dept_value).unique().tolist())
     vals = {v for v in vals if v.strip()}
     return ["All departments"] + sorted(vals)
+
+
+# --------------------
+# Check-in frequency helpers (used in Employee & Manager and Compare sections)
+# --------------------
+def _find_checkin_freq_col_emp(df: pd.DataFrame) -> str | None:
+    return _find_col_by_keywords(df, ["had", "check", "in", "meeting", "with", "my", "manager"]) or \
+        _find_col_by_keywords(df, ["check", "in", "meeting", "my", "manager"])
+
+def _find_checkin_freq_col_mgr(df: pd.DataFrame) -> str | None:
+    return _find_col_by_keywords(df, ["had", "check", "in", "meeting", "with", "this", "person"]) or \
+        _find_col_by_keywords(df, ["check", "in", "meeting", "this", "person"])
+
+FREQ_CATS = ["Weekly", "Monthly", "Few", "Zero"]
+
+def _norm_freq(x: str) -> str:
+    s = _norm(x)
+    if "week" in s:
+        return "Weekly"
+    if "month" in s:
+        return "Monthly"
+    if "few" in s:
+        return "Few"
+    if "zero" in s or s == "0":
+        return "Zero"
+    return "Unknown"
 
 
 # --------------------
@@ -1743,21 +1837,6 @@ def _analysis_ui(df_raw: pd.DataFrame, who: str, year: int | None = None):
         st.caption(f"No responses: {int(no_mask.sum())} | Non-empty elaborations: {len(texts)}")
 
         if texts:
-            scores_all = [_sentiment_score(t) for t in texts]
-            labels_all = [_sentiment_label(s) for s in scores_all]
-            overall = (
-                pd.Series(labels_all)
-                .value_counts()
-                .reindex(["Negative", "Neutral", "Positive"])
-                .fillna(0)
-                .astype(int)
-            )
-
-            s1, s2, s3 = st.columns(3)
-            s1.metric("Negative", int(overall["Negative"]))
-            s2.metric("Neutral", int(overall["Neutral"]))
-            s3.metric("Positive", int(overall["Positive"]))
-
             col1, col2 = st.columns([1.2, 0.8])
             with col1:
                 section_title("Recurring topics (with sentiment)")
@@ -1786,7 +1865,6 @@ def _analysis_ui(df_raw: pd.DataFrame, who: str, year: int | None = None):
                 df_kw = _top_keywords(texts, top_n=25)
                 st.dataframe(df_kw, use_container_width=True, hide_index=True)
                 _download_df_csv(df_kw, "reasons_for_no_top_keywords.csv", key="dl_no_top_keywords")
-
         else:
             st.info("No elaboration text found for employees who answered 'No'.")
     else:
@@ -1873,44 +1951,149 @@ if section == "KPIs":
         
     divider()
 
-    with st.expander("Upload / Data settings", expanded=not st.session_state.clean_ready):
+    with st.expander("Data Source & Filters", expanded=not st.session_state.clean_ready):
+
+        st.markdown(
+            """
+            <div style="padding: 12px 14px; border: 1px solid #e5e7eb; border-radius: 10px; background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);">
+              <div style="font-weight: 700; font-size: 15px; margin-bottom: 6px;">Data source</div>
+              <div style="color: #475467;">Pick a source for KPI calculations. Using the curated Data folder keeps years and names aligned automatically.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        source_mode = st.radio(
+            "Choose source",
+            options=["Data folder (recommended)", "Manual upload"],
+            horizontal=True,
+            key="kpi_source_mode",
+        )
+        use_data = source_mode.startswith("Data folder")
+        st.session_state.use_data_kpis = use_data
 
         base_path = Path(os.getcwd())
         years, _ = _available_years_from_data(base_path)
 
-        if years:
-            selected_year_data = st.selectbox(
-                "Select year (from Data folder)",
-                options=years,
-                index=len(years) - 1,
-                key="kpi_year_from_data"
-            )
-            use_data = st.checkbox(
-                "Use Data folder files (recommended)",
-                value=True,
-                key="use_data_kpis"
-            )
-        else:
-            use_data = False
-            st.warning("No complete year files detected in Data/ (need both employee + manager files with year in name).")
+        # Initialize file upload variables
+        emp_file = None
+        mgr_file = None
 
-        col_left, col_right = st.columns(2)
-        with col_left:
-            emp_file = st.file_uploader(
-                "Employee Check-In File (.xlsx/.xls/.csv)",
-                type=["xlsx", "xls", "csv"],
-                key="emp"
-            )
-        with col_right:
-            mgr_file = st.file_uploader(
-                "Manager Check-In File (.xlsx/.xls/.csv)",
-                type=["xlsx", "xls", "csv"],
-                key="mgr"
-            )
+        if use_data:
+            if not years:
+                st.warning("No complete year files detected in Data/ (need both employee + manager files with year in name).")
+        else:
+            col_left, col_right = st.columns(2)
+            with col_left:
+                emp_file = st.file_uploader(
+                    "Employee Check-In File (.xlsx/.xls/.csv)",
+                    type=["xlsx", "xls", "csv"],
+                    key="emp",
+                )
+            with col_right:
+                mgr_file = st.file_uploader(
+                    "Manager Check-In File (.xlsx/.xls/.csv)",
+                    type=["xlsx", "xls", "csv"],
+                    key="mgr",
+                )
 
         mena_df_preview = _load_static_mena()
         if mena_df_preview.empty:
             st.warning("No Mena Report file detected in Data/ or root. Place one before cleaning.")
+
+        # Filters (always visible). Populate immediately from available sources.
+        year_options = ["All years"]
+        dept_choices = ["All departments"]
+        default_year = st.session_state.get("kpi_year_filter")
+
+        # Data folder mode: show all detected years immediately
+        if use_data and years:
+            year_options = ["All years"] + list(years)
+            if default_year is None or default_year not in year_options:
+                default_year = years[-1]
+            
+            # Load raw files from Data folder to get departments (use latest year)
+            try:
+                _, by_year = _available_years_from_data(base_path)
+                latest_year = years[-1]
+                if latest_year in by_year and "emp" in by_year[latest_year] and "mgr" in by_year[latest_year]:
+                    def _read(p):
+                        if p.suffix.lower() == ".csv":
+                            return pd.read_csv(str(p))
+                        return pd.read_excel(str(p))
+                    
+                    emp_raw = _read(by_year[latest_year]["emp"])
+                    mgr_raw = _read(by_year[latest_year]["mgr"])
+                    dept_choices = _dept_options(emp_raw, mgr_raw)
+            except Exception:
+                pass  # Keep default if loading fails
+        
+        # Manual upload mode: populate when files are uploaded
+        elif not use_data and emp_file and mgr_file:
+            try:
+                emp_raw = _load_df(emp_file)
+                mgr_raw = _load_df(mgr_file)
+                
+                # Extract years
+                emp_with_year = _add_year_from_timestamp(emp_raw)
+                mgr_with_year = _add_year_from_timestamp(mgr_raw)
+                
+                emp_years = sorted([int(y) for y in emp_with_year["Year"].dropna().unique()]) if "Year" in emp_with_year.columns else []
+                mgr_years = sorted([int(y) for y in mgr_with_year["Year"].dropna().unique()]) if "Year" in mgr_with_year.columns else []
+                detected_years = sorted(set(emp_years) | set(mgr_years))
+                if detected_years:
+                    year_options = ["All years"] + detected_years
+                
+                # Extract departments
+                dept_choices = _dept_options(emp_raw, mgr_raw)
+            except Exception:
+                pass  # Keep defaults if loading fails
+        
+        # Override with cleaned data if available
+        if st.session_state.clean_ready and st.session_state.cleaned_emp is not None and st.session_state.cleaned_mgr is not None:
+            emp_for_filters = st.session_state.cleaned_emp.copy()
+            mgr_for_filters = st.session_state.cleaned_mgr.copy()
+            
+            if "Year" not in emp_for_filters.columns:
+                emp_for_filters = _add_year_from_timestamp(emp_for_filters)
+            if "Year" not in mgr_for_filters.columns:
+                mgr_for_filters = _add_year_from_timestamp(mgr_for_filters)
+
+            emp_years = sorted([int(y) for y in emp_for_filters["Year"].dropna().unique()]) if "Year" in emp_for_filters.columns else []
+            mgr_years = sorted([int(y) for y in mgr_for_filters["Year"].dropna().unique()]) if "Year" in mgr_for_filters.columns else []
+            detected_years = sorted(set(emp_years) | set(mgr_years))
+            if detected_years:
+                year_options = ["All years"] + detected_years
+
+            dept_choices = _dept_options(emp_for_filters, mgr_for_filters)
+
+        # Resolve indices for selects
+        if default_year in year_options:
+            year_index = year_options.index(default_year)
+        else:
+            year_index = 0
+
+        c_year, c_dept = st.columns(2)
+        with c_year:
+            st.selectbox(
+                "Filter by year",
+                options=year_options,
+                index=year_index,
+                key="kpi_year_filter",
+            )
+        with c_dept:
+            st.selectbox(
+                "Filter by department",
+                options=dept_choices,
+                index=0,
+                key="kpi_dept_filter",
+            )
+
+        # Show status after cleaning
+        if st.session_state.clean_ready and st.session_state.cleaned_emp is not None and st.session_state.cleaned_mgr is not None:
+            emp_dept_col = "Company Name / Department" if "Company Name / Department" in st.session_state.cleaned_emp.columns else _find_dept_col(st.session_state.cleaned_emp)
+            mgr_dept_col = "Company Name/Department" if "Company Name/Department" in st.session_state.cleaned_mgr.columns else _find_dept_col(st.session_state.cleaned_mgr)
+            st.caption(f"📊 Filters active: {len(year_options)-1} year(s), {len(dept_choices)-1} department(s) | Emp dept col: {emp_dept_col or 'Not found'}, Mgr dept col: {mgr_dept_col or 'Not found'}")
 
         
     run_btn = st.button("Run", type="primary", use_container_width=True)
@@ -1928,6 +2111,11 @@ if section == "KPIs":
 
 
         if use_data:
+            # Choose year to load: prefer selected filter year if valid; else latest detected year.
+            selected_year_data = st.session_state.get("kpi_year_filter")
+            if selected_year_data == "All years" or selected_year_data not in years:
+                selected_year_data = years[-1] if years else None
+
             cleaned_emp, cleaned_mgr, combined = _load_and_clean_year_from_data(selected_year_data)
 
             if cleaned_emp.empty or cleaned_mgr.empty:
@@ -1970,31 +2158,18 @@ if section == "KPIs":
         st.error(st.session_state.clean_error)
 
     if st.session_state.clean_ready and st.session_state.cleaned_emp is not None and st.session_state.cleaned_mgr is not None:
-        st.success("Cleaning complete ✅")
         st.caption(f"Employee rows: {len(st.session_state.cleaned_emp)} | Manager rows: {len(st.session_state.cleaned_mgr)}")
 
-        cleaned_emp = st.session_state.cleaned_emp
-        cleaned_mgr = st.session_state.cleaned_mgr
+        cleaned_emp = _add_year_from_timestamp(st.session_state.cleaned_emp)
+        cleaned_mgr = _add_year_from_timestamp(st.session_state.cleaned_mgr)
 
-        # ---- Add Year column first (safe even if Timestamp missing) ----
-        cleaned_emp = _add_year_from_timestamp(cleaned_emp)
-        cleaned_mgr = _add_year_from_timestamp(cleaned_mgr)
+        # Persist updated data with Year column
+        st.session_state.cleaned_emp = cleaned_emp
+        st.session_state.cleaned_mgr = cleaned_mgr
 
-        # Build year options
-        year_options = ["All years"]
-        emp_years = sorted([int(y) for y in cleaned_emp["Year"].dropna().unique()]) if "Year" in cleaned_emp.columns else []
-        mgr_years = sorted([int(y) for y in cleaned_mgr["Year"].dropna().unique()]) if "Year" in cleaned_mgr.columns else []
-        year_options += sorted(set(emp_years) | set(mgr_years))
-
-        # Department options
-        dept_choices = _dept_options(cleaned_emp, cleaned_mgr)
-
-        # UI: Year + Department side-by-side
-        c_year, c_dept = st.columns(2)
-        with c_year:
-            selected_year = st.selectbox("Filter by year", options=year_options, index=0, key="kpi_year_filter")
-        with c_dept:
-            selected_dept = st.selectbox("Filter by department", options=dept_choices, index=0, key="kpi_dept_filter")
+        # Pull selected filters (set in Data Source & Filters expander)
+        selected_year = st.session_state.get("kpi_year_filter", "All years")
+        selected_dept = st.session_state.get("kpi_dept_filter", "All departments")
 
         # Apply Year filter first
         def _filter_by_year(df: pd.DataFrame, year_sel):
@@ -2006,8 +2181,8 @@ if section == "KPIs":
         mgr_tmp = _filter_by_year(cleaned_mgr, selected_year)
 
         # Then apply Department filter
-        emp_dept_col = _find_dept_col(emp_tmp)
-        mgr_dept_col = _find_dept_col(mgr_tmp)
+        emp_dept_col = "Company Name / Department" if "Company Name / Department" in emp_tmp.columns else _find_dept_col(emp_tmp)
+        mgr_dept_col = "Company Name/Department" if "Company Name/Department" in mgr_tmp.columns else _find_dept_col(mgr_tmp)
 
         emp_f = _filter_by_dept(emp_tmp, emp_dept_col, selected_dept)
         mgr_f = _filter_by_dept(mgr_tmp, mgr_dept_col, selected_dept)
@@ -2084,44 +2259,66 @@ if section == "KPIs":
             divider()
             with st.expander("Additional Employee KPIs (keyword-based)", expanded=False):
 
-                cols = st.columns(4)
-                cols[0].metric("Stress rate (Employees)", _pct(m["emp_stress"]))
-                cols[1].metric("HR pulse request rate", _pct(m["hr_pulse"]))
-
-                for i, (label, keys) in enumerate(EMP_YN_KPIS):
-                    rate, col = _yes_rate_from_keywords(emp_f, keys)
-                    value = _pct(rate) if col else "N/A"
-                    cols[i % 4].metric(label, value)
-                    if (i % 4) == 3 and i != len(EMP_YN_KPIS) - 1:
-                        cols = st.columns(4)
-
-                for label, keys, good_min in EMP_SCALE_KPIS:
-                    rate, col = _scale_good_rate_from_keywords(emp_f, keys, good_min=good_min)
-                    st.metric(label, _pct(rate) if col else "N/A")
-
-                divider()
+                # 1st KPI: Alignment on Department Goals
                 section_title("Alignment on Department Goals")
 
-                aligned_col = _find_aligned_goals_col(emp_f)  # the helper you created earlier
+                aligned_col = _find_aligned_goals_col(emp_f)
                 elab_col = _find_if_no_elaborate_col(emp_f)
 
                 if not aligned_col:
                     st.info("Could not detect the alignment question.")
                 else:
-                    yes = _yes_mask(emp_f[aligned_col])
-                    no  = _no_mask(emp_f[aligned_col])
+                    yes_count, no_count, yes_pct, no_pct = _count_yes_no(emp_f, aligned_col)
 
                     c1, c2 = st.columns(2)
-                    c1.metric("Yes (Aligned)", int(yes.sum()))
-                    c2.metric("No (Not aligned)", int(no.sum()))
+                    c1.metric("Yes (Aligned)", yes_count, f"{yes_pct:.1f}%")
+                    c2.metric("No (Not aligned)", no_count, f"{no_pct:.1f}%")
 
-                    if int(no.sum()) > 0 and elab_col:
-                        reasons = emp_f.loc[no, elab_col].dropna().astype(str).map(_clean_text)
+                    if no_count > 0 and elab_col:
+                        no_mask = _no_mask(emp_f[aligned_col])
+                        reasons = emp_f.loc[no_mask, elab_col].dropna().astype(str).map(_clean_text)
                         reasons = [r for r in reasons.tolist() if r.strip()]
                         if reasons:
                             df_kw = _top_keywords(reasons, top_n=15)
                             st.dataframe(df_kw, use_container_width=True, hide_index=True)
                             _download_df_csv(df_kw, "alignment_no_reasons_top_keywords.csv", key="dl_align_no_keywords")
+
+                divider()
+
+                # Remaining KPIs in specified order
+                cols = st.columns(4)
+                
+                # 2nd: Discussed professional goals
+                rate, col = _yes_rate_from_keywords(emp_f, ["discuss", "professional", "goals"])
+                cols[0].metric("Discussed professional goals", _pct(rate) if col else "N/A")
+                
+                # 3rd: Job requirements changed
+                rate, col = _yes_rate_from_keywords(emp_f, ["encountered", "changes", "job", "requirements"])
+                cols[1].metric("Job requirements changed", _pct(rate) if col else "N/A")
+                
+                # 4th: Adapted well (4–5)
+                rate, col = _scale_good_rate_from_keywords(emp_f, ["able", "adapt", "job", "requirements"], good_min=4)
+                cols[2].metric("Adapted well (4–5)", _pct(rate) if col else "N/A")
+                
+                # 5th: Tasks aligned with growth
+                rate, col = _yes_rate_from_keywords(emp_f, ["tasks", "aligned", "growth"])
+                cols[3].metric("Tasks aligned with growth", _pct(rate) if col else "N/A")
+                
+                cols = st.columns(4)
+                
+                # 6th: Manager considers input
+                rate, col = _yes_rate_from_keywords(emp_f, ["seek", "consider", "input"])
+                cols[0].metric("Manager considers input", _pct(rate) if col else "N/A")
+                
+                # 7th: HR pulse request rate
+                cols[1].metric("HR pulse request rate", _pct(m["hr_pulse"]))
+                
+                # 8th: Recommend company
+                rate, col = _yes_rate_from_keywords(emp_f, ["recommend", "company"])
+                cols[2].metric("Recommend company", _pct(rate) if col else "N/A")
+                
+                # Employee Stress (additional metric, not in the ordered list)
+                cols[3].metric("Stress rate (Employees)", _pct(m["emp_stress"]))
 
 
             divider()
@@ -2358,39 +2555,44 @@ if section == "KPIs":
 
 
             divider()
-            section_title("Pulse-Check Meeting (Slide 26)")
+            with st.expander("Pulse-Check Meeting (Slide 26)", expanded=False):
+                pulse_col = _find_pulse_yn_col_emp(emp_f)
+                reason_col = _find_pulse_reason_col_emp(emp_f)
 
-            pulse_col = _find_pulse_yn_col_emp(emp_f)
-            reason_col = _find_pulse_reason_col_emp(emp_f)
+                tab1, tab2 = st.tabs(["Overview", "Reasons (YES only)"])
 
-            if not pulse_col:
-                st.info("Could not detect the Pulse-Check meeting Yes/No question in employee data.")
-            else:
-                yes_mask = _yes_mask(emp_f[pulse_col])
-                no_mask  = _no_mask(emp_f[pulse_col])
+                with tab1:
+                    if not pulse_col:
+                        st.info("Could not detect the Pulse-Check meeting Yes/No question in employee data.")
+                    else:
+                        yes_mask = _yes_mask(emp_f[pulse_col])
+                        no_mask  = _no_mask(emp_f[pulse_col])
 
-                yes_count = int(yes_mask.sum())
-                no_count  = int(no_mask.sum())
+                        yes_count = int(yes_mask.sum())
+                        no_count  = int(no_mask.sum())
 
-                left, right = st.columns(2)
-                with left:
-                    st.subheader("Employees who said YES")
-                    st.metric("YES", yes_count)
-                with right:
-                    st.subheader("Employees who said NO")
-                    st.metric("NO", no_count)
+                        left, right = st.columns(2)
+                        with left:
+                            st.subheader("Employees who said YES")
+                            st.metric("YES", yes_count)
+                        with right:
+                            st.subheader("Employees who said NO")
+                            st.metric("NO", no_count)
 
-                # Reasons (only YES responders)
-                divider()
-                section_title("Reasons (Employees who said YES)")
-
-                if reason_col and reason_col in emp_f.columns and yes_count > 0:
-                    counts = _pulse_reason_counts(emp_f.loc[yes_mask, reason_col])
-                    for reason, cnt in counts.items():
-                        if int(cnt) > 0:
-                            st.write(f"• {reason}: **{int(cnt)}**")
-                else:
-                    st.caption("Reason column not detected (or no YES responses).")
+                with tab2:
+                    if not pulse_col:
+                        st.info("Could not detect the Pulse-Check meeting Yes/No question in employee data.")
+                    elif not reason_col or reason_col not in emp_f.columns:
+                        st.caption("Reason column not detected (or no YES responses).")
+                    else:
+                        yes_mask = _yes_mask(emp_f[pulse_col])
+                        counts = _pulse_reason_counts(emp_f.loc[yes_mask, reason_col])
+                        if counts.empty:
+                            st.caption("Reason column not detected (or no YES responses).")
+                        else:
+                            for reason, cnt in counts.items():
+                                if int(cnt) > 0:
+                                    st.write(f"• {reason}: **{int(cnt)}**")
 
             divider()
             section_title("Company Resources (Slide 27)")
@@ -2405,7 +2607,6 @@ if section == "KPIs":
                 st.info("Employee name column 'Your Name' not found in employee data.")
             else:
                 counts = {k: 0 for k in RES_ORDER}
-                not_app_names = []
                 other_entries = []
 
                 for _, r in emp_f.iterrows():
@@ -2422,22 +2623,30 @@ if section == "KPIs":
                     for k in norm_picks:
                         counts[k] += 1
 
-                    # Not applicable names
-                    if "Not Applicable" in norm_picks and emp_name:
-                        not_app_names.append(emp_name)
-
                     # Other: Name + text (if the other text column exists)
                     if "Other" in norm_picks and emp_name and other_text_col and other_text_col in emp_f.columns:
                         txt = str(r.get(other_text_col, "")).strip()
                         if txt:
                             other_entries.append(f'{emp_name}: "{txt}"')
 
-                # Display counts (like slide)
-                st.write(f"**Enrolling in the group's wellness sessions**: {counts[RES_ORDER[0]]}")
-                st.write(f"**Seeking advice from HR**: {counts['Seeking advice from HR']}")
-                st.write(f"**Expressing complaints or miscellaneous ideas**: {counts['Expressing complaints or miscellaneous ideas']}")
-                st.write(f"**Other**: {counts['Other']}")
-                st.write(f"**Not Applicable**: {counts['Not Applicable']}")
+                # Display counts as a table
+                rows = []
+                label_map = {
+                    "Enrolling in the group's wellness sessions": "Enrolling in the group's wellness sessions",
+                    "Seeking advice from HR": "Seeking advice from HR",
+                    "Expressing complaints or miscellaneous ideas": "Expressing complaints or miscellaneous ideas",
+                    "Other": "Other",
+                    "Not Applicable": "Not Applicable",
+                }
+                for key in RES_ORDER:
+                    if key in counts:
+                        rows.append({"Company Resource": label_map.get(key, key), "Count": counts[key]})
+
+                if rows:
+                    df_resources = pd.DataFrame(rows)
+                    st.dataframe(df_resources, use_container_width=True, hide_index=True)
+                else:
+                    st.caption("No responses found for Company Resources.")
 
                 # Other section
                 if other_entries:
@@ -2446,13 +2655,6 @@ if section == "KPIs":
                     for x in other_entries:
                         st.write(x)
 
-                # Not Applicable names section
-                if not_app_names:
-                    divider()
-                    st.subheader("Not Applicable")
-                    for nm in sorted(set(not_app_names)):
-                        st.write(nm)
-
                 
 
         # --- Manager KPIs ---
@@ -2460,7 +2662,78 @@ if section == "KPIs":
             divider()
             section_title("Manager KPIs")
 
-            # Separate sections per question (Manager-specific)
+            # --- Additional Manager KPIs (keyword-based) - FIRST ---
+            with st.expander("Additional Manager KPIs (Yes %)", expanded=True):
+                st.caption("Showing percentage of employees for whom managers answered YES to each question")
+                
+                cols = st.columns(4)
+                
+                # 1. Encountered changes in job requirements
+                rate, col = _yes_rate_from_keywords(mgr_f, ["encountered", "changes", "job", "requirements"])
+                yes_count, no_count, yes_pct, no_pct = _count_yes_no(mgr_f, col) if col else (0, 0, 0, 0)
+                cols[0].metric(
+                    "Encountered job changes",
+                    f"{yes_count} ({yes_pct:.1f}%)" if col else "N/A",
+                    help=f"Column: {col}" if col else "Column not detected"
+                )
+                
+                # 2. At risk of low performance
+                rate, col = _yes_rate_from_keywords(mgr_f, ["at risk", "low performance"])
+                if not col:
+                    rate, col = _yes_rate_from_keywords(mgr_f, ["risk", "performance"])
+                yes_count, no_count, yes_pct, no_pct = _count_yes_no(mgr_f, col) if col else (0, 0, 0, 0)
+                cols[1].metric(
+                    "At risk of low performance",
+                    f"{yes_count} ({yes_pct:.1f}%)" if col else "N/A",
+                    help=f"Column: {col}" if col else "Column not detected"
+                )
+                
+                # 3. Would perform better in another department
+                rate, col = _yes_rate_from_keywords(mgr_f, ["perform better", "another department"])
+                if not col:
+                    rate, col = _yes_rate_from_keywords(mgr_f, ["better", "department"])
+                yes_count, no_count, yes_pct, no_pct = _count_yes_no(mgr_f, col) if col else (0, 0, 0, 0)
+                cols[2].metric(
+                    "Better in another dept",
+                    f"{yes_count} ({yes_pct:.1f}%)" if col else "N/A",
+                    help=f"Column: {col}" if col else "Column not detected"
+                )
+                
+                # 4. Ready for promotion today
+                rate, col = _yes_rate_from_keywords(mgr_f, ["ready", "promotion"])
+                yes_count, no_count, yes_pct, no_pct = _count_yes_no(mgr_f, col) if col else (0, 0, 0, 0)
+                cols[3].metric(
+                    "Ready for promotion",
+                    f"{yes_count} ({yes_pct:.1f}%)" if col else "N/A",
+                    help=f"Column: {col}" if col else "Column not detected"
+                )
+                
+                # Second row
+                cols2 = st.columns(4)
+                
+                # 5. Actively seek and consider team members' input
+                rate, col = _yes_rate_from_keywords(mgr_f, ["actively seek", "team members", "input"])
+                if not col:
+                    rate, col = _yes_rate_from_keywords(mgr_f, ["seek", "consider", "input"])
+                yes_count, no_count, yes_pct, no_pct = _count_yes_no(mgr_f, col) if col else (0, 0, 0, 0)
+                cols2[0].metric(
+                    "Seeks team input",
+                    f"{yes_count} ({yes_pct:.1f}%)" if col else "N/A",
+                    help=f"Column: {col}" if col else "Column not detected"
+                )
+                
+                # 6. Fits in company culture
+                rate, col = _yes_rate_from_keywords(mgr_f, ["fits", "company culture"])
+                if not col:
+                    rate, col = _yes_rate_from_keywords(mgr_f, ["person", "fits", "culture"])
+                yes_count, no_count, yes_pct, no_pct = _count_yes_no(mgr_f, col) if col else (0, 0, 0, 0)
+                cols2[1].metric(
+                    "Fits in company culture",
+                    f"{yes_count} ({yes_pct:.1f}%)" if col else "N/A",
+                    help=f"Column: {col}" if col else "Column not detected"
+                )
+
+            divider()
 
             # Consolidated table matching spec: At Risk Yes, Reason, PIP, Reason if no
             with st.expander("At Risk of Low Performance", expanded=True):
@@ -2518,7 +2791,6 @@ if section == "KPIs":
 
             with st.expander("Manager Stress about Employee", expanded=True):
                 st.metric("Manager Stress rate", _pct(m["mgr_stress"]))
-
 
             # --- Manager insights — Promotion ---
             divider()
@@ -2780,30 +3052,6 @@ if section == "KPIs":
                     
 
         elif view_choice == "Employee & Manager":
-
-            def _find_checkin_freq_col_emp(df: pd.DataFrame) -> str | None:
-                return _find_col_by_keywords(df, ["had", "check", "in", "meeting", "with", "my", "manager"]) or \
-                    _find_col_by_keywords(df, ["check", "in", "meeting", "my", "manager"])
-
-            def _find_checkin_freq_col_mgr(df: pd.DataFrame) -> str | None:
-                return _find_col_by_keywords(df, ["had", "check", "in", "meeting", "with", "this", "person"]) or \
-                    _find_col_by_keywords(df, ["check", "in", "meeting", "this", "person"])
-
-
-            FREQ_CATS = ["Weekly", "Monthly", "Few", "Zero"]
-
-            def _norm_freq(x: str) -> str:
-                s = _norm(x)
-                if "week" in s:
-                    return "Weekly"
-                if "month" in s:
-                    return "Monthly"
-                if "few" in s:
-                    return "Few"
-                if "zero" in s or s == "0":
-                    return "Zero"
-                return "Unknown"
-
 
             def _find_adapt_scale_col_emp(df: pd.DataFrame) -> str | None:
                     # "During the year 2025, I was able to adapt to changes in my job requirements"
@@ -3279,49 +3527,166 @@ elif section == "Analysis":
 # -------------------------
 elif section == "Compare":
     divider()
-    section_title("Compare")
+    section_title("Year-over-Year Comparison")
+    
+    # Auto-detect and load check-in files from Data folder
+    checkin_base = Path("Data/Check-ins 2024 2025")
+    
+    def _auto_load_checkin_files():
+        """Auto-detect the latest two years of check-in files."""
+        files_info = {}
+        
+        if checkin_base.exists():
+            # Look for year subdirectories
+            year_dirs = sorted([d for d in checkin_base.iterdir() if d.is_dir() and d.name.isdigit()], reverse=True)
+            
+            if len(year_dirs) >= 2:
+                # Latest year (Year 2)
+                y2_dir = year_dirs[0]
+                y2 = int(y2_dir.name)
+                
+                # Previous year (Year 1)
+                y1_dir = year_dirs[1]
+                y1 = int(y1_dir.name)
+                
+                # Find employee and manager files for Year 2
+                emp_y2 = None
+                mgr_y2 = None
+                for f in y2_dir.glob("*.xlsx"):
+                    # Skip temporary Excel files (start with ~$)
+                    if f.name.startswith("~$"):
+                        continue
+                    fname_lower = f.name.lower()
+                    if "employee answers" in fname_lower or "employee questions" in fname_lower and "performance check-in" in fname_lower:
+                        emp_y2 = f
+                    elif "manager answers" in fname_lower or "manager questions" in fname_lower and "performance check-in" in fname_lower:
+                        mgr_y2 = f
+                
+                # Find employee and manager files for Year 1
+                emp_y1 = None
+                mgr_y1 = None
+                for f in y1_dir.glob("*.xlsx"):
+                    # Skip temporary Excel files (start with ~$)
+                    if f.name.startswith("~$"):
+                        continue
+                    fname_lower = f.name.lower()
+                    if "employee answers" in fname_lower or "employee questions" in fname_lower and "performance check-in" in fname_lower:
+                        emp_y1 = f
+                    elif "manager answers" in fname_lower or "manager questions" in fname_lower and "performance check-in" in fname_lower:
+                        mgr_y1 = f
+                
+                files_info = {
+                    "y1": y1,
+                    "y2": y2,
+                    "emp_y1": emp_y1,
+                    "mgr_y1": mgr_y1,
+                    "emp_y2": emp_y2,
+                    "mgr_y2": mgr_y2,
+                }
+        
+        return files_info
+    
+    auto_files = _auto_load_checkin_files()
+    
+    # Show auto-detected files info
+    if auto_files and all([auto_files.get("emp_y1"), auto_files.get("mgr_y1"), auto_files.get("emp_y2"), auto_files.get("mgr_y2")]):
+        st.success(f"✅ Auto-detected files for {auto_files['y1']} vs {auto_files['y2']} comparison")
+        with st.expander("📁 Auto-detected files", expanded=False):
+            st.caption(f"**Year 1 ({auto_files['y1']}):**")
+            st.caption(f"  • Employee: {auto_files['emp_y1'].name}")
+            st.caption(f"  • Manager: {auto_files['mgr_y1'].name}")
+            st.caption(f"**Year 2 ({auto_files['y2']}):**")
+            st.caption(f"  • Employee: {auto_files['emp_y2'].name}")
+            st.caption(f"  • Manager: {auto_files['mgr_y2'].name}")
 
-    base_path = Path(os.getcwd())
-    df_mena = _load_static_mena()
+    with st.expander("Upload Files for Comparison (Optional - overrides auto-detection)", expanded=not st.session_state.yoy_ready and not auto_files):
+        st.markdown(
+            """
+            <div style="padding: 12px 14px; border: 1px solid #e5e7eb; border-radius: 10px; background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);">
+              <div style="font-weight: 700; font-size: 15px; margin-bottom: 6px;">Manual Upload (Optional)</div>
+              <div style="color: #475467;">Upload check-in files for two different years to compare KPIs and trends. Leave empty to use auto-detected files.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    if df_mena.empty:
-        st.error("Static Mena Report file not found in root. Place 'Mena Report.xlsx' or CSV variant.")
-    else:
-        try:
-            paths = _find_data_candidates(base_path)
-            by_year = _classify_year_files(paths)
-            years = sorted(by_year.keys())
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Year 1 (Earlier)")
+            emp_file_y1 = st.file_uploader(
+                "Employee Check-In (Year 1)",
+                type=["xlsx", "xls", "csv"],
+                key="compare_emp_y1",
+            )
+            mgr_file_y1 = st.file_uploader(
+                "Manager Check-In (Year 1)",
+                type=["xlsx", "xls", "csv"],
+                key="compare_mgr_y1",
+            )
+        
+        with col2:
+            st.subheader("Year 2 (Later)")
+            emp_file_y2 = st.file_uploader(
+                "Employee Check-In (Year 2)",
+                type=["xlsx", "xls", "csv"],
+                key="compare_emp_y2",
+            )
+            mgr_file_y2 = st.file_uploader(
+                "Manager Check-In (Year 2)",
+                type=["xlsx", "xls", "csv"],
+                key="compare_mgr_y2",
+            )
 
-            if len(years) < 2:
-                st.warning("Need at least two years of files in Data/ to compare.")
+    compare_btn = st.button("Run Comparison", type="primary", use_container_width=True)
+
+    if compare_btn:
+        st.session_state.yoy_ready = False
+        st.session_state.yoy_payload = None
+
+        df_mena = _load_static_mena()
+        if df_mena.empty:
+            st.error("Mena Report file not found in Data/ or root. Place 'Mena Report.xlsx' before comparing.")
+        else:
+            # Use auto-detected files if manual uploads are not provided
+            use_emp_y1 = emp_file_y1 if emp_file_y1 else (auto_files.get("emp_y1") if auto_files else None)
+            use_mgr_y1 = mgr_file_y1 if mgr_file_y1 else (auto_files.get("mgr_y1") if auto_files else None)
+            use_emp_y2 = emp_file_y2 if emp_file_y2 else (auto_files.get("emp_y2") if auto_files else None)
+            use_mgr_y2 = mgr_file_y2 if mgr_file_y2 else (auto_files.get("mgr_y2") if auto_files else None)
+            
+            if not (use_emp_y1 and use_mgr_y1 and use_emp_y2 and use_mgr_y2):
+                st.error("Please upload all four files (Employee + Manager for both years) or ensure auto-detection found all files.")
             else:
-                y2, y1 = years[-1], years[-2]
-
-                missing = []
-                for y in [y1, y2]:
-                    if "emp" not in by_year[y] or "mgr" not in by_year[y]:
-                        missing.append(y)
-
-                if missing:
-                    st.warning(f"Missing employee/manager files for years: {', '.join(map(str, missing))}.")
-                else:
+                try:
                     cleaner = CheckInExcelCleaner()
 
-                    def _read_any(p: Path) -> pd.DataFrame:
-                        if p.suffix.lower() == ".csv":
-                            return pd.read_csv(str(p))
-                        return pd.read_excel(str(p))
+                    # Load dataframes - handle both file paths and uploaded files
+                    def _load_file(file_or_path):
+                        if isinstance(file_or_path, Path):
+                            return pd.read_excel(file_or_path) if file_or_path.suffix in ['.xlsx', '.xls'] else pd.read_csv(file_or_path)
+                        else:
+                            return _load_df(file_or_path)
+                    
+                    emp1 = _load_file(use_emp_y1)
+                    mgr1 = _load_file(use_mgr_y1)
+                    emp2 = _load_file(use_emp_y2)
+                    mgr2 = _load_file(use_mgr_y2)
 
-                    emp1 = _read_any(by_year[y1]["emp"])
-                    mgr1 = _read_any(by_year[y1]["mgr"])
-                    emp2 = _read_any(by_year[y2]["emp"])
-                    mgr2 = _read_any(by_year[y2]["mgr"])
+                    # Detect years from timestamp columns
+                    emp1_w_year = _add_year_from_timestamp(emp1)
+                    emp2_w_year = _add_year_from_timestamp(emp2)
+                    
+                    y1_emp = emp1_w_year["Year"].dropna().mode()[0] if "Year" in emp1_w_year.columns and not emp1_w_year["Year"].dropna().empty else "Year 1"
+                    y2_emp = emp2_w_year["Year"].dropna().mode()[0] if "Year" in emp2_w_year.columns and not emp2_w_year["Year"].dropna().empty else "Year 2"
+                    
+                    y1 = int(y1_emp) if isinstance(y1_emp, (int, float)) else y1_emp
+                    y2 = int(y2_emp) if isinstance(y2_emp, (int, float)) else y2_emp
 
-                    st.info(f"Cleaning {y1}…")
+                    st.info(f"Cleaning Year 1 ({y1})…")
                     emp1_c = cleaner.clean_employee_checkin(emp1, df_mena)
                     mgr1_c = cleaner.clean_manager_checkin(mgr1, df_mena)
 
-                    st.info(f"Cleaning {y2}…")
+                    st.info(f"Cleaning Year 2 ({y2})…")
                     emp2_c = cleaner.clean_employee_checkin(emp2, df_mena)
                     mgr2_c = cleaner.clean_manager_checkin(mgr2, df_mena)
 
@@ -3347,11 +3712,14 @@ elif section == "Compare":
                         "y1": y1, "y2": y2,
                         "m1": m1, "m2": m2,
                         "risk_y1": risk_df_y1, "risk_y2": risk_df_y2,
+                        "emp1_c": emp1_c, "mgr1_c": mgr1_c,
+                        "emp2_c": emp2_c, "mgr2_c": mgr2_c,
                     }
+                    st.success("Comparison ready! ✅")
 
-        except Exception as e:
-            st.error(f"Year-over-Year load failed: {e}")
-            st.exception(e)
+                except Exception as e:
+                    st.error(f"Comparison failed: {e}")
+                    st.exception(e)
 
     if st.session_state.yoy_ready and st.session_state.yoy_payload:
         y1 = st.session_state.yoy_payload["y1"]
@@ -3360,47 +3728,549 @@ elif section == "Compare":
         m2 = st.session_state.yoy_payload["m2"]
         risk_df_y1 = st.session_state.yoy_payload["risk_y1"]
         risk_df_y2 = st.session_state.yoy_payload["risk_y2"]
+        
+        # Store cleaned data for detailed comparisons
+        emp1_c = st.session_state.yoy_payload.get("emp1_c")
+        mgr1_c = st.session_state.yoy_payload.get("mgr1_c")
+        emp2_c = st.session_state.yoy_payload.get("emp2_c")
+        mgr2_c = st.session_state.yoy_payload.get("mgr2_c")
 
-        section_title("Summary")
-        col_y1, col_y2 = st.columns(2)
+        # High-level summary cards
+        divider()
+        section_title("Quick Summary")
+        
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric(
+                "Employee Stress",
+                _pct(m2["emp_stress"]),
+                delta=_pct(m2["emp_stress"] - m1["emp_stress"]),
+                delta_color="inverse"
+            )
+        with c2:
+            st.metric(
+                "At Risk Rate",
+                _pct(m2["emp_at_risk"]),
+                delta=_pct(m2["emp_at_risk"] - m1["emp_at_risk"]),
+                delta_color="inverse"
+            )
+        with c3:
+            st.metric(
+                "Manager Stress",
+                _pct(m2["mgr_stress"]),
+                delta=_pct(m2["mgr_stress"] - m1["mgr_stress"]),
+                delta_color="inverse"
+            )
+        with c4:
+            st.metric(
+                "HR Pulse Requests",
+                _pct(m2["hr_pulse"]),
+                delta=_pct(m2["hr_pulse"] - m1["hr_pulse"]),
+                delta_color="inverse"
+            )
 
-        with col_y1:
-            st.subheader(str(y1))
-            st.metric("Employee Completion", _pct(m1["emp_completion"]))
-            st.metric("Manager Completion", _pct(m1["mgr_completion"]))
-            st.metric("Employee Stress", _pct(m1["emp_stress"]))
-            st.metric("At Risk (Employees)", _pct(m1["emp_at_risk"]))
+        divider()
+        
+        # Detailed comparison tabs
+        view_tab = st.radio(
+            "Select comparison view",
+            options=["� Employee Insights", "👔 Manager Insights", "🔄 Combined Analysis"],
+            horizontal=True,
+            key="yoy_view_tab",
+        )
 
-            if not risk_df_y1.empty:
-                st.download_button(
-                    f"Download at-risk employees ({y1})",
-                    risk_df_y1.to_csv(index=False).encode("utf-8"),
-                    file_name=f"at_risk_employees_{y1}.csv",
-                    mime="text/csv",
-                    key=f"dl_risk_{y1}",
-                    use_container_width=True,
-                )
+        # ========================================
+        # TAB 1: EMPLOYEE INSIGHTS
+        # ========================================
+        if view_tab == "👥 Employee Insights":
+            divider()
+            section_title(f"Employee Insights: {y1} vs {y2}")
+            
+            if emp1_c is None or emp2_c is None:
+                st.warning("Employee cleaned data not available. Please re-run the comparison.")
             else:
-                st.caption("No at-risk employees detected (or risk column not found).")
+                # Additional Employee KPIs - FIRST
+                with st.expander("📊 Additional Employee KPIs Comparison", expanded=True):
+                    st.markdown(f"**Comparing additional employee KPIs: {y1} vs {y2}**")
+                    
+                    # Create a comparison table for all additional KPIs
+                    kpi_data = []
+                    
+                    # 1. Alignment on Department Goals
+                    col1 = _find_aligned_goals_col(emp1_c)
+                    col2 = _find_aligned_goals_col(emp2_c)
+                    if col1 and col2:
+                        yes1, _, pct1, _ = _count_yes_no(emp1_c, col1)
+                        yes2, _, pct2, _ = _count_yes_no(emp2_c, col2)
+                        kpi_data.append(["Alignment on Dept Goals (Yes)", yes1, f"{pct1:.1f}%", yes2, f"{pct2:.1f}%", yes2 - yes1])
+                    
+                    # 2. Discussed professional goals
+                    rate1, col1 = _yes_rate_from_keywords(emp1_c, ["discuss", "professional", "goals"])
+                    rate2, col2 = _yes_rate_from_keywords(emp2_c, ["discuss", "professional", "goals"])
+                    if col1 and col2:
+                        yes1, _, pct1, _ = _count_yes_no(emp1_c, col1)
+                        yes2, _, pct2, _ = _count_yes_no(emp2_c, col2)
+                        kpi_data.append(["Discussed Professional Goals", yes1, f"{pct1:.1f}%", yes2, f"{pct2:.1f}%", yes2 - yes1])
+                    
+                    # 3. Job requirements changed
+                    rate1, col1 = _yes_rate_from_keywords(emp1_c, ["encountered", "changes", "job", "requirements"])
+                    rate2, col2 = _yes_rate_from_keywords(emp2_c, ["encountered", "changes", "job", "requirements"])
+                    if col1 and col2:
+                        yes1, _, pct1, _ = _count_yes_no(emp1_c, col1)
+                        yes2, _, pct2, _ = _count_yes_no(emp2_c, col2)
+                        kpi_data.append(["Job Requirements Changed", yes1, f"{pct1:.1f}%", yes2, f"{pct2:.1f}%", yes2 - yes1])
+                    
+                    # 4. Adapted well (4-5)
+                    rate1, col1 = _scale_good_rate_from_keywords(emp1_c, ["able", "adapt", "job", "requirements"], good_min=4)
+                    rate2, col2 = _scale_good_rate_from_keywords(emp2_c, ["able", "adapt", "job", "requirements"], good_min=4)
+                    if col1 and col2:
+                        numeric1 = pd.to_numeric(emp1_c[col1], errors='coerce')
+                        numeric2 = pd.to_numeric(emp2_c[col2], errors='coerce')
+                        good1 = int((numeric1 >= 4).sum())
+                        good2 = int((numeric2 >= 4).sum())
+                        total1 = int(numeric1.notna().sum())
+                        total2 = int(numeric2.notna().sum())
+                        pct1 = (good1 / total1 * 100) if total1 > 0 else 0
+                        pct2 = (good2 / total2 * 100) if total2 > 0 else 0
+                        kpi_data.append(["Adapted Well (4-5 rating)", good1, f"{pct1:.1f}%", good2, f"{pct2:.1f}%", good2 - good1])
+                    
+                    # 5. Tasks aligned with growth
+                    rate1, col1 = _yes_rate_from_keywords(emp1_c, ["tasks", "aligned", "growth"])
+                    rate2, col2 = _yes_rate_from_keywords(emp2_c, ["tasks", "aligned", "growth"])
+                    if col1 and col2:
+                        yes1, _, pct1, _ = _count_yes_no(emp1_c, col1)
+                        yes2, _, pct2, _ = _count_yes_no(emp2_c, col2)
+                        kpi_data.append(["Tasks Aligned with Growth", yes1, f"{pct1:.1f}%", yes2, f"{pct2:.1f}%", yes2 - yes1])
+                    
+                    # 6. Manager considers input
+                    rate1, col1 = _yes_rate_from_keywords(emp1_c, ["seek", "consider", "input"])
+                    rate2, col2 = _yes_rate_from_keywords(emp2_c, ["seek", "consider", "input"])
+                    if col1 and col2:
+                        yes1, _, pct1, _ = _count_yes_no(emp1_c, col1)
+                        yes2, _, pct2, _ = _count_yes_no(emp2_c, col2)
+                        kpi_data.append(["Manager Considers Input", yes1, f"{pct1:.1f}%", yes2, f"{pct2:.1f}%", yes2 - yes1])
+                    
+                    # 7. Recommend company
+                    rate1, col1 = _yes_rate_from_keywords(emp1_c, ["recommend", "company"])
+                    rate2, col2 = _yes_rate_from_keywords(emp2_c, ["recommend", "company"])
+                    if col1 and col2:
+                        yes1, _, pct1, _ = _count_yes_no(emp1_c, col1)
+                        yes2, _, pct2, _ = _count_yes_no(emp2_c, col2)
+                        kpi_data.append(["Recommend Company", yes1, f"{pct1:.1f}%", yes2, f"{pct2:.1f}%", yes2 - yes1])
+                    
+                    if kpi_data:
+                        kpi_df = pd.DataFrame(kpi_data, columns=["KPI", f"{y1} Count", f"{y1} %", f"{y2} Count", f"{y2} %", "Change"])
+                        st.dataframe(kpi_df, use_container_width=True, hide_index=True)
+                        _download_df_csv(kpi_df, f"employee_kpis_comparison_{y1}_{y2}.csv", key="dl_yoy_emp_kpis")
+                    else:
+                        st.caption("Unable to detect additional employee KPI questions in both years")
+                
+                divider()
+                
+                # Stress comparison
+                with st.expander("🔴 Stress Analysis", expanded=True):
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.subheader(f"{y1}")
+                        freq_col_1 = _find_stress_freq_col_emp(emp1_c)
+                        if freq_col_1:
+                            tmp1 = emp1_c.copy()
+                            tmp1["_stress_freq"] = tmp1[freq_col_1].astype(str).map(_norm_stress_freq)
+                            counts1 = tmp1["_stress_freq"].value_counts().reindex(STRESS_FREQ_ORDER, fill_value=0)
+                            
+                            for label in STRESS_FREQ_ORDER:
+                                st.metric(label, int(counts1[label]))
+                        else:
+                            st.caption("Stress frequency column not detected")
+                    
+                    with col2:
+                        st.subheader(f"{y2}")
+                        freq_col_2 = _find_stress_freq_col_emp(emp2_c)
+                        if freq_col_2:
+                            tmp2 = emp2_c.copy()
+                            tmp2["_stress_freq"] = tmp2[freq_col_2].astype(str).map(_norm_stress_freq)
+                            counts2 = tmp2["_stress_freq"].value_counts().reindex(STRESS_FREQ_ORDER, fill_value=0)
+                            
+                            for label in STRESS_FREQ_ORDER:
+                                delta = int(counts2[label] - counts1[label]) if freq_col_1 else 0
+                                st.metric(label, int(counts2[label]), delta=delta)
+                        else:
+                            st.caption("Stress frequency column not detected")
+                
+                # Pulse-Check Meeting
+                with st.expander("💬 Pulse-Check Meeting Requests", expanded=False):
+                    col1, col2 = st.columns(2)
+                    
+                    pulse_col_1 = _find_pulse_yn_col_emp(emp1_c)
+                    pulse_col_2 = _find_pulse_yn_col_emp(emp2_c)
+                    
+                    if pulse_col_1 and pulse_col_2:
+                        yes1 = int(_yes_mask(emp1_c[pulse_col_1]).sum())
+                        yes2 = int(_yes_mask(emp2_c[pulse_col_2]).sum())
+                        
+                        with col1:
+                            st.subheader(f"{y1}")
+                            st.metric("Employees who said YES", yes1)
+                        
+                        with col2:
+                            st.subheader(f"{y2}")
+                            st.metric("Employees who said YES", yes2, delta=yes2 - yes1)
+                    else:
+                        st.caption("Pulse-Check question not detected in one or both years")
+                
+                # Work Environment
+                with st.expander("🏢 Supportive Work Environment", expanded=False):
+                    col1, col2 = st.columns(2)
+                    
+                    env1_col = None
+                    for c in emp1_c.columns:
+                        h = _norm(c)
+                        if ("collabor" in h) and ("support" in h) and ("environment" in h):
+                            env1_col = c
+                            break
+                    
+                    env2_col = None
+                    for c in emp2_c.columns:
+                        h = _norm(c)
+                        if ("collabor" in h) and ("support" in h) and ("environment" in h):
+                            env2_col = c
+                            break
+                    
+                    if env1_col and env2_col:
+                        yes1 = int(_yes_mask(emp1_c[env1_col]).sum())
+                        no1 = int(_no_mask(emp1_c[env1_col]).sum())
+                        yes2 = int(_yes_mask(emp2_c[env2_col]).sum())
+                        no2 = int(_no_mask(emp2_c[env2_col]).sum())
+                        
+                        with col1:
+                            st.subheader(f"{y1}")
+                            st.metric("YES", yes1)
+                            st.metric("NO", no1)
+                        
+                        with col2:
+                            st.subheader(f"{y2}")
+                            st.metric("YES", yes2, delta=yes2 - yes1)
+                            st.metric("NO", no2, delta=no2 - no1, delta_color="inverse")
+                    else:
+                        st.caption("Supportive work environment question not detected")
+                
+                # Department Dynamics
+                with st.expander("📈 Department Dynamics Enhancement", expanded=False):
+                    dyn_col_1 = _find_dynamics_col_emp(emp1_c)
+                    dyn_col_2 = _find_dynamics_col_emp(emp2_c)
+                    
+                    if dyn_col_1 and dyn_col_2:
+                        counts1 = _dynamics_counts(emp1_c[dyn_col_1])
+                        counts2 = _dynamics_counts(emp2_c[dyn_col_2])
+                        
+                        # Side-by-side bar chart
+                        labels = DYNAMICS_ORDER
+                        values1 = [int(counts1.get(k, 0)) for k in labels]
+                        values2 = [int(counts2.get(k, 0)) for k in labels]
+                        
+                        y = np.arange(len(labels))
+                        width = 0.35
+                        
+                        fig, ax = plt.subplots(figsize=(10, 5))
+                        ax.barh([i - width/2 for i in y], values1, width, label=str(y1), alpha=0.8)
+                        ax.barh([i + width/2 for i in y], values2, width, label=str(y2), alpha=0.8)
+                        ax.set_yticks(y)
+                        ax.set_yticklabels(labels)
+                        ax.invert_yaxis()
+                        ax.set_xlabel("Count")
+                        ax.set_title(f"Department Dynamics: {y1} vs {y2}")
+                        ax.legend()
+                        
+                        st.pyplot(fig, clear_figure=False)
+                        _download_fig_png(fig, f"dynamics_comparison_{y1}_{y2}.png", key="dl_yoy_dynamics")
+                    else:
+                        st.caption("Department dynamics question not detected")
 
-        with col_y2:
-            st.subheader(str(y2))
-            st.metric("Employee Completion", _pct(m2["emp_completion"]), delta=_pct(m2["emp_completion"] - m1["emp_completion"]))
-            st.metric("Manager Completion", _pct(m2["mgr_completion"]), delta=_pct(m2["mgr_completion"] - m1["mgr_completion"]))
-            st.metric("Employee Stress", _pct(m2["emp_stress"]), delta=_pct(m2["emp_stress"] - m1["emp_stress"]))
-            st.metric("At Risk (Employees)", _pct(m2["emp_at_risk"]), delta=_pct(m2["emp_at_risk"] - m1["emp_at_risk"]))
-
-            if not risk_df_y2.empty:
-                st.download_button(
-                    f"Download at-risk employees ({y2})",
-                    risk_df_y2.to_csv(index=False).encode("utf-8"),
-                    file_name=f"at_risk_employees_{y2}.csv",
-                    mime="text/csv",
-                    key=f"dl_risk_{y2}",
-                    use_container_width=True,
-                )
+        # ========================================
+        # TAB 3: MANAGER INSIGHTS
+        # ========================================
+        elif view_tab == "👔 Manager Insights":
+            divider()
+            section_title(f"Manager Insights: {y1} vs {y2}")
+            
+            if mgr1_c is None or mgr2_c is None:
+                st.warning("Manager cleaned data not available. Please re-run the comparison.")
             else:
-                st.caption("No at-risk employees detected (or risk column not found).")
+                # Additional Manager KPIs - FIRST
+                with st.expander("📊 Additional Manager KPIs Comparison", expanded=True):
+                    st.markdown(f"**Comparing additional manager KPIs: {y1} vs {y2}**")
+                    st.caption("Showing percentage of employees for whom managers answered YES")
+                    
+                    # Create a comparison table for all 6 manager KPIs
+                    kpi_data = []
+                    
+                    # 1. Encountered changes in job requirements
+                    rate1, col1 = _yes_rate_from_keywords(mgr1_c, ["encountered", "changes", "job", "requirements"])
+                    rate2, col2 = _yes_rate_from_keywords(mgr2_c, ["encountered", "changes", "job", "requirements"])
+                    if col1 and col2:
+                        yes1, _, pct1, _ = _count_yes_no(mgr1_c, col1)
+                        yes2, _, pct2, _ = _count_yes_no(mgr2_c, col2)
+                        kpi_data.append(["Encountered Job Changes", yes1, f"{pct1:.1f}%", yes2, f"{pct2:.1f}%", yes2 - yes1])
+                    
+                    # 2. At risk of low performance
+                    rate1, col1 = _yes_rate_from_keywords(mgr1_c, ["at risk", "low performance"])
+                    if not col1:
+                        rate1, col1 = _yes_rate_from_keywords(mgr1_c, ["risk", "performance"])
+                    rate2, col2 = _yes_rate_from_keywords(mgr2_c, ["at risk", "low performance"])
+                    if not col2:
+                        rate2, col2 = _yes_rate_from_keywords(mgr2_c, ["risk", "performance"])
+                    if col1 and col2:
+                        yes1, _, pct1, _ = _count_yes_no(mgr1_c, col1)
+                        yes2, _, pct2, _ = _count_yes_no(mgr2_c, col2)
+                        kpi_data.append(["At Risk of Low Performance", yes1, f"{pct1:.1f}%", yes2, f"{pct2:.1f}%", yes2 - yes1])
+                    
+                    # 3. Would perform better in another department
+                    rate1, col1 = _yes_rate_from_keywords(mgr1_c, ["perform better", "another department"])
+                    if not col1:
+                        rate1, col1 = _yes_rate_from_keywords(mgr1_c, ["better", "department"])
+                    rate2, col2 = _yes_rate_from_keywords(mgr2_c, ["perform better", "another department"])
+                    if not col2:
+                        rate2, col2 = _yes_rate_from_keywords(mgr2_c, ["better", "department"])
+                    if col1 and col2:
+                        yes1, _, pct1, _ = _count_yes_no(mgr1_c, col1)
+                        yes2, _, pct2, _ = _count_yes_no(mgr2_c, col2)
+                        kpi_data.append(["Better in Another Dept", yes1, f"{pct1:.1f}%", yes2, f"{pct2:.1f}%", yes2 - yes1])
+                    
+                    # 4. Ready for promotion today
+                    rate1, col1 = _yes_rate_from_keywords(mgr1_c, ["ready", "promotion"])
+                    rate2, col2 = _yes_rate_from_keywords(mgr2_c, ["ready", "promotion"])
+                    if col1 and col2:
+                        yes1, _, pct1, _ = _count_yes_no(mgr1_c, col1)
+                        yes2, _, pct2, _ = _count_yes_no(mgr2_c, col2)
+                        kpi_data.append(["Ready for Promotion", yes1, f"{pct1:.1f}%", yes2, f"{pct2:.1f}%", yes2 - yes1])
+                    
+                    # 5. Actively seek and consider team members' input
+                    rate1, col1 = _yes_rate_from_keywords(mgr1_c, ["actively seek", "team members", "input"])
+                    if not col1:
+                        rate1, col1 = _yes_rate_from_keywords(mgr1_c, ["seek", "consider", "input"])
+                    rate2, col2 = _yes_rate_from_keywords(mgr2_c, ["actively seek", "team members", "input"])
+                    if not col2:
+                        rate2, col2 = _yes_rate_from_keywords(mgr2_c, ["seek", "consider", "input"])
+                    if col1 and col2:
+                        yes1, _, pct1, _ = _count_yes_no(mgr1_c, col1)
+                        yes2, _, pct2, _ = _count_yes_no(mgr2_c, col2)
+                        kpi_data.append(["Seeks Team Input", yes1, f"{pct1:.1f}%", yes2, f"{pct2:.1f}%", yes2 - yes1])
+                    
+                    # 6. Fits in company culture
+                    rate1, col1 = _yes_rate_from_keywords(mgr1_c, ["fits", "company culture"])
+                    if not col1:
+                        rate1, col1 = _yes_rate_from_keywords(mgr1_c, ["person", "fits", "culture"])
+                    rate2, col2 = _yes_rate_from_keywords(mgr2_c, ["fits", "company culture"])
+                    if not col2:
+                        rate2, col2 = _yes_rate_from_keywords(mgr2_c, ["person", "fits", "culture"])
+                    if col1 and col2:
+                        yes1, _, pct1, _ = _count_yes_no(mgr1_c, col1)
+                        yes2, _, pct2, _ = _count_yes_no(mgr2_c, col2)
+                        kpi_data.append(["Fits in Company Culture", yes1, f"{pct1:.1f}%", yes2, f"{pct2:.1f}%", yes2 - yes1])
+                    
+                    if kpi_data:
+                        kpi_df = pd.DataFrame(kpi_data, columns=["KPI", f"{y1} Count", f"{y1} %", f"{y2} Count", f"{y2} %", "Change"])
+                        st.dataframe(kpi_df, use_container_width=True, hide_index=True)
+                        _download_df_csv(kpi_df, f"manager_kpis_comparison_{y1}_{y2}.csv", key="dl_yoy_mgr_kpis")
+                    else:
+                        st.caption("Unable to detect additional manager KPI questions in both years")
+                
+                divider()
+                
+                # At Risk comparison
+                with st.expander("⚠️ At Risk of Low Performance", expanded=True):
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.subheader(f"{y1}")
+                        st.metric("Employees at risk", len(risk_df_y1))
+                        if not risk_df_y1.empty:
+                            st.dataframe(risk_df_y1[["Subordinate Name"]].head(10), use_container_width=True, hide_index=True)
+                    
+                    with col2:
+                        st.subheader(f"{y2}")
+                        delta = len(risk_df_y2) - len(risk_df_y1)
+                        st.metric("Employees at risk", len(risk_df_y2), delta=delta, delta_color="inverse")
+                        if not risk_df_y2.empty:
+                            st.dataframe(risk_df_y2[["Subordinate Name"]].head(10), use_container_width=True, hide_index=True)
+                
+                # Manager Stress
+                with st.expander("😰 Manager Stress about Employees", expanded=False):
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.subheader(f"{y1}")
+                        st.metric("Manager Stress Rate", _pct(m1["mgr_stress"]))
+                    
+                    with col2:
+                        st.subheader(f"{y2}")
+                        st.metric("Manager Stress Rate", _pct(m2["mgr_stress"]), delta=_pct(m2["mgr_stress"] - m1["mgr_stress"]))
+                
+                # Promotion readiness
+                with st.expander("🎯 Promotion Readiness", expanded=False):
+                    promo_col_1 = _find_ready_for_promotion_col(mgr1_c)
+                    promo_col_2 = _find_ready_for_promotion_col(mgr2_c)
+                    
+                    if promo_col_1 and promo_col_2:
+                        yes1 = int(_yes_mask(mgr1_c[promo_col_1]).sum())
+                        no1 = int(_no_mask(mgr1_c[promo_col_1]).sum())
+                        yes2 = int(_yes_mask(mgr2_c[promo_col_2]).sum())
+                        no2 = int(_no_mask(mgr2_c[promo_col_2]).sum())
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.subheader(f"{y1}")
+                            st.metric("Ready for promotion (Yes)", yes1)
+                            st.metric("Not ready (No)", no1)
+                        
+                        with col2:
+                            st.subheader(f"{y2}")
+                            st.metric("Ready for promotion (Yes)", yes2, delta=yes2 - yes1)
+                            st.metric("Not ready (No)", no2, delta=no2 - no1)
+                    else:
+                        st.caption("Promotion readiness question not detected")
+                
+                # Culture fit
+                with st.expander("🎭 Company Culture Fit", expanded=False):
+                    culture_col_1 = _find_col_by_keywords(mgr1_c, ["fits", "company", "culture"])
+                    culture_col_2 = _find_col_by_keywords(mgr2_c, ["fits", "company", "culture"])
+                    
+                    if culture_col_1 and culture_col_2:
+                        yes1 = int(_yes_mask(mgr1_c[culture_col_1]).sum())
+                        no1 = int(_no_mask(mgr1_c[culture_col_1]).sum())
+                        yes2 = int(_yes_mask(mgr2_c[culture_col_2]).sum())
+                        no2 = int(_no_mask(mgr2_c[culture_col_2]).sum())
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.subheader(f"{y1}")
+                            st.metric("Employees fit culture", yes1)
+                            st.metric("Don't fit", no1)
+                        
+                        with col2:
+                            st.subheader(f"{y2}")
+                            st.metric("Employees fit culture", yes2, delta=yes2 - yes1)
+                            st.metric("Don't fit", no2, delta=no2 - no1, delta_color="inverse")
+                    else:
+                        st.caption("Culture fit question not detected")
+
+        # ========================================
+        # TAB 4: COMBINED ANALYSIS
+        # ========================================
+        elif view_tab == "🔄 Combined Analysis":
+            divider()
+            section_title(f"Combined Employee & Manager Analysis: {y1} vs {y2}")
+            
+            if emp1_c is None or emp2_c is None or mgr1_c is None or mgr2_c is None:
+                st.warning("Complete cleaned data not available. Please re-run the comparison.")
+            else:
+                # Job changes
+                with st.expander("💼 Changes in Job Responsibilities", expanded=True):
+                    emp_yn_col_1 = _find_job_change_yn_col_emp(emp1_c)
+                    mgr_yn_col_1 = _find_job_change_yn_col_mgr(mgr1_c)
+                    emp_yn_col_2 = _find_job_change_yn_col_emp(emp2_c)
+                    mgr_yn_col_2 = _find_job_change_yn_col_mgr(mgr2_c)
+                    
+                    if emp_yn_col_1 and mgr_yn_col_1 and emp_yn_col_2 and mgr_yn_col_2:
+                        emp_yes_1 = int(_yes_mask(emp1_c[emp_yn_col_1]).sum())
+                        mgr_yes_1 = int(_yes_mask(mgr1_c[mgr_yn_col_1]).sum())
+                        emp_yes_2 = int(_yes_mask(emp2_c[emp_yn_col_2]).sum())
+                        mgr_yes_2 = int(_yes_mask(mgr2_c[mgr_yn_col_2]).sum())
+                        
+                        st.markdown("**Yes responses comparison:**")
+                        
+                        comparison_df = pd.DataFrame({
+                            "Perspective": ["Employees", "Managers"],
+                            str(y1): [emp_yes_1, mgr_yes_1],
+                            str(y2): [emp_yes_2, mgr_yes_2],
+                            "Change": [emp_yes_2 - emp_yes_1, mgr_yes_2 - mgr_yes_1]
+                        })
+                        
+                        st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("Job change questions not detected in both years")
+                
+                # Check-in meeting frequency
+                with st.expander("📅 Check-in Meeting Frequency", expanded=False):
+                    emp_freq_col_1 = _find_checkin_freq_col_emp(emp1_c)
+                    mgr_freq_col_1 = _find_checkin_freq_col_mgr(mgr1_c)
+                    emp_freq_col_2 = _find_checkin_freq_col_emp(emp2_c)
+                    mgr_freq_col_2 = _find_checkin_freq_col_mgr(mgr2_c)
+                    
+                    if emp_freq_col_1 and mgr_freq_col_1 and emp_freq_col_2 and mgr_freq_col_2:
+                        def _pct_series(s: pd.Series) -> pd.Series:
+                            base = s[s.isin(FREQ_CATS)]
+                            if len(base) == 0:
+                                return pd.Series({k: 0.0 for k in FREQ_CATS})
+                            return (base.value_counts(normalize=True) * 100).reindex(FREQ_CATS, fill_value=0.0)
+                        
+                        emp_freq_1 = emp1_c[emp_freq_col_1].astype(str).map(_norm_freq)
+                        mgr_freq_1 = mgr1_c[mgr_freq_col_1].astype(str).map(_norm_freq)
+                        emp_freq_2 = emp2_c[emp_freq_col_2].astype(str).map(_norm_freq)
+                        mgr_freq_2 = mgr2_c[mgr_freq_col_2].astype(str).map(_norm_freq)
+                        
+                        emp_pct_1 = _pct_series(emp_freq_1)
+                        mgr_pct_1 = _pct_series(mgr_freq_1)
+                        emp_pct_2 = _pct_series(emp_freq_2)
+                        mgr_pct_2 = _pct_series(mgr_freq_2)
+                        
+                        # Create comparison chart
+                        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+                        
+                        y = np.arange(len(FREQ_CATS))
+                        h = 0.35
+                        
+                        # Year 1
+                        ax1.barh(y - h/2, mgr_pct_1.values, height=h, label="Managers", alpha=0.8)
+                        ax1.barh(y + h/2, emp_pct_1.values, height=h, label="Employees", alpha=0.8)
+                        ax1.set_yticks(y)
+                        ax1.set_yticklabels(FREQ_CATS)
+                        ax1.invert_yaxis()
+                        ax1.set_xlabel("% of responses")
+                        ax1.set_title(f"{y1}")
+                        ax1.legend()
+                        
+                        # Year 2
+                        ax2.barh(y - h/2, mgr_pct_2.values, height=h, label="Managers", alpha=0.8)
+                        ax2.barh(y + h/2, emp_pct_2.values, height=h, label="Employees", alpha=0.8)
+                        ax2.set_yticks(y)
+                        ax2.set_yticklabels(FREQ_CATS)
+                        ax2.invert_yaxis()
+                        ax2.set_xlabel("% of responses")
+                        ax2.set_title(f"{y2}")
+                        ax2.legend()
+                        
+                        st.pyplot(fig, clear_figure=False)
+                        _download_fig_png(fig, f"checkin_freq_comparison_{y1}_{y2}.png", key="dl_yoy_checkin_freq")
+                    else:
+                        st.caption("Check-in frequency questions not detected in both years")
+                
+                # Reward & Recognition
+                with st.expander("🏆 Reward & Recognition Methods", expanded=False):
+                    emp_recog_col_1 = _find_col_by_keywords(emp1_c, ["rewards", "recognizes", "contribution"])
+                    mgr_recog_col_1 = _find_col_by_keywords(mgr1_c, ["recognize", "reward", "contributions"])
+                    emp_recog_col_2 = _find_col_by_keywords(emp2_c, ["rewards", "recognizes", "contribution"])
+                    mgr_recog_col_2 = _find_col_by_keywords(mgr2_c, ["recognize", "reward", "contributions"])
+                    
+                    if all([emp_recog_col_1, mgr_recog_col_1, emp_recog_col_2, mgr_recog_col_2]):
+                        emp_counts_1 = _recog_counts(emp1_c[emp_recog_col_1])
+                        mgr_counts_1 = _recog_counts(mgr1_c[mgr_recog_col_1])
+                        emp_counts_2 = _recog_counts(emp2_c[emp_recog_col_2])
+                        mgr_counts_2 = _recog_counts(mgr2_c[mgr_recog_col_2])
+                        
+                        comparison_df = pd.DataFrame({
+                            "Method": RECOG_ORDER,
+                            f"Emp {y1}": [int(emp_counts_1.get(m, 0)) for m in RECOG_ORDER],
+                            f"Mgr {y1}": [int(mgr_counts_1.get(m, 0)) for m in RECOG_ORDER],
+                            f"Emp {y2}": [int(emp_counts_2.get(m, 0)) for m in RECOG_ORDER],
+                            f"Mgr {y2}": [int(mgr_counts_2.get(m, 0)) for m in RECOG_ORDER],
+                        })
+                        
+                        st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+                        _download_df_csv(comparison_df, f"recognition_comparison_{y1}_{y2}.csv", key="dl_yoy_recognition")
+                    else:
+                        st.caption("Recognition questions not detected in both years")
 
 
 divider()
