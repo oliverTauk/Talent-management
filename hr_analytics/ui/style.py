@@ -61,6 +61,10 @@ def apply_global_style():
             border-radius: 18px;
             padding: 16px 16px 14px 16px;
             box-shadow: 0 12px 30px rgba(15, 23, 42, 0.06);
+            height: 140px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
         }
         .hr-card + .hr-card {
             margin-top: 12px;
@@ -211,10 +215,6 @@ def divider():
     st.markdown("<div class='hr-divider'></div>", unsafe_allow_html=True)
 
 
-def note(text: str):
-    st.markdown(f"<div class='hr-note'>{text}</div>", unsafe_allow_html=True)
-
-
 def card(title: str | None = None, body: str | None = None):
     """Simple card container used by Home.py."""
     st.markdown(
@@ -226,8 +226,4 @@ def card(title: str | None = None, body: str | None = None):
         """,
         unsafe_allow_html=True,
     )
-
-
-def subsection_title(text: str):
-    st.markdown(f"<div class='hr-subsection'>{text}</div>", unsafe_allow_html=True)
 

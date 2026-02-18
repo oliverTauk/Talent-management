@@ -1,19 +1,112 @@
 import io
 import os
 import re
-from collections import Counter
 from pathlib import Path
+
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 import numpy as np
-
 import pandas as pd
 import streamlit as st
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 from hr_analytics.services.checkin_cleaner_excel import CheckInExcelCleaner
 from hr_analytics.services.kpis import KPIService
 from hr_analytics.ui.style import apply_global_style, page_header, section_title, divider
+from hr_analytics.ui.downloads import _download_df_csv, _download_fig_png
+
+# --- Column detection ---
+from hr_analytics.services.column_detection import (
+    _norm,
+    _find_col_by_keywords,
+    _find_aligned_goals_col,
+    _find_if_no_elaborate_col,
+    _yes_rate_from_keywords,
+    _scale_good_rate_from_keywords,
+    _find_mgr_behavior_question_col_emp,
+    _find_manager_name_col_emp,
+    _find_ready_for_promotion_col,
+    _find_employee_name_col,
+    _find_your_name_col,
+    _find_subordinate_name_col,
+    _find_promo_position_col,
+    _find_promo_review_date_col,
+    _find_risk_reason_col,
+    _find_pip_reason_no_col,
+    _find_checkin_freq_col_emp,
+    _find_checkin_freq_col_mgr,
+    _find_company_resources_col_emp,
+    _find_resources_other_text_col_emp,
+    _find_pulse_yn_col_emp,
+    _find_pulse_reason_col_emp,
+    _find_stress_freq_col_emp,
+    _find_stress_reason_col_emp,
+    _find_stress_reasons_col,
+    _find_mgr_stress_freq_col,
+    _find_mgr_dynamics_col_mgr,
+    _find_dynamics_col_emp,
+    _find_team_integration_col_emp,
+    _find_team_integration_col_mgr,
+    _find_input_seek_col_emp,
+    _find_input_seek_col_mgr,
+    _find_job_change_yn_col_emp,
+    _find_job_change_yn_col_mgr,
+    _find_job_change_types_col,
+)
+
+# --- Normalizers, constants, masks, helpers ---
+from hr_analytics.services.normalizers import (
+    _yes_mask,
+    _no_mask,
+    _count_yes_no,
+    _split_multiselect,
+    POS_TAGS,
+    NEG_TAGS,
+    _norm_behavior_opt,
+    STRESS_FREQ_ORDER,
+    _norm_stress_freq,
+    STRESS_REASON_ORDER,
+    _norm_stress_reason,
+    _stress_reason_counts,
+    MGR_DYNAMICS_ORDER,
+    _mgr_dynamics_counts,
+    DYNAMICS_ORDER,
+    _dynamics_counts,
+    _norm_team_integration,
+    MISTAKE_ORDER,
+    UNDESIRED,
+    _norm_mistake_opt,
+    _mistake_counts,
+    RECOG_ORDER,
+    _recog_counts,
+    CHANGE_CATS,
+    _change_counts,
+    FREQ_CATS,
+    _norm_freq,
+    RES_ORDER,
+    _norm_resource_opt,
+    _pulse_reason_counts,
+    _parse_any_date,
+    _extract_month_year_label,
+    _find_dept_col,
+    _filter_by_dept,
+    _dept_options,
+    _add_year_from_timestamp,
+    _metrics,
+    _pct,
+)
+
+# --- Text analysis ---
+from hr_analytics.services.text_analysis import (
+    _sentiment_score,
+    _sentiment_label,
+    _top_keywords,
+    _clean_text,
+    _detect_open_ended_columns,
+    _topic_summary_with_sentiment,
+    _reasons_action_plan,
+    _is_elaboration_header,
+    _build_reasons_for_no_pairs,
+)
 
 
 # --------------------
@@ -35,1586 +128,9 @@ page_header("Check-ins", "KPIs • Analysis • Compare")
 st.sidebar.title("Check-ins")
 section = st.sidebar.radio(
     "Sections",
-    ["KPIs", "Analysis", "Compare"],
+    ["KPIs", "Compare"],
     index=0
 )
-
-# ------------------------------------------------------------
-# Defaults for analysis constants to avoid NameError at runtime
-# ------------------------------------------------------------
-# Lightweight English stopwords; keep minimal and safe
-STOPWORDS: set[str] = {
-    "the","a","an","and","or","but","if","then","so","of","in","on","at","to","for","from","by",
-    "is","are","was","were","be","been","being","it","its","as","with","that","this","these","those",
-    "we","us","our","you","your","they","them","their","i","me","my","mine",
-}
-
-# Topic buckets used for grouping open-ended responses
-TOPIC_BUCKETS: dict[str, list[str]] = {
-    "Workload & Pressure": [
-        "workload","pressure","overload","deadline","deadlines","overtime","hours","capacity","too much","overworked"
-    ],
-    "Tools & Systems": [
-        "tool","tools","system","systems","software","app","portal","access","login","bug","bugs","slow","issue","issues","downtime"
-    ],
-    "Process & Approvals": [
-        "process","processes","approval","approvals","approve","workflow","procedure","procedures","steps","delay","delays","blocked","bottleneck","policy","policies"
-    ],
-    "Communication": [
-        "communication","communicate","feedback","meeting","meetings","update","updates","clarity","information","email","emails","message","messages","respond","response"
-    ],
-    "Management & Leadership": [
-        "manager","management","leadership","supervisor","support","micromanage","micromanagement","recognition","guidance","direction","decisions"
-    ],
-    "Culture & Team": [
-        "culture","team","teams","collaboration","collaborate","conflict","environment","respect","inclusive","inclusion","toxic","engagement"
-    ],
-    "Career & Growth": [
-        "career","growth","promotion","promotions","develop","development","training","learning","skills","skill","path","progression"
-    ],
-    "Compensation & Benefits": [
-        "compensation","salary","salaries","pay","benefits","bonus","bonuses","allowance","package","raise","raises"
-    ],
-    "Wellbeing & Stress": [
-        "wellbeing","wellness","stress","stressed","burnout","mental","health","work-life","balance","leave","time off","vacation"
-    ],
-}
-
-
-# ============================================================
-# Keyword matching helpers (KPIs + Analysis)
-# ============================================================
-
-
-def _make_col_finder(*keyword_sets):
-    """Factory to create column finder functions with fallback keyword sets."""
-    def finder(df: pd.DataFrame) -> str | None:
-        for keywords in keyword_sets:
-            col = _find_col_by_keywords(df, keywords)
-            if col:
-                return col
-        return None
-    return finder
-
-# Column finders using factory pattern
-_find_aligned_goals_col = _make_col_finder(
-    ["aware", "aligned", "manager", "department", "goal"],
-    ["aligned", "department", "goals"]
-)
-
-_find_if_no_elaborate_col = _make_col_finder(
-    ["if", "no", "elaborate"],
-    ["if", "no", "please", "elaborate"]
-)
-
-
-
-def _norm(s: str) -> str:
-    s = str(s).lower()
-    s = re.sub(r"\s+", " ", s)          # collapse spaces/newlines
-    s = re.sub(r"[^\w\s]", " ", s)      # remove punctuation
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def _find_mgr_behavior_question_col_emp(df: pd.DataFrame) -> str | None:
-    # Employee question: "Please check the true statement(s) below about your manager"
-    return (
-        _find_col_by_keywords(df, ["true", "statement", "manager"]) or
-        _find_col_by_keywords(df, ["check", "statement", "manager"]) or
-        _find_col_by_keywords(df, ["below", "about", "your", "manager"])
-    )
-
-def _norm_behavior_opt(opt: str) -> str:
-    s = _norm(opt)
-
-    # POSITIVE
-    if "clear" in s and "guid" in s:
-        return "POS: clear guidance"
-    if "continuous" in s and "feedback" in s:
-        return "POS: continuous feedback"
-    if "recognition" in s or ("recogn" in s and "work" in s):
-        return "POS: recognition"
-    if ("opportunit" in s and ("develop" in s or "grow" in s)) or ("develop" in s and "grow" in s):
-        return "POS: growth"
-
-    # NEGATIVE
-    if "insufficient" in s and ("information" in s or "info" in s):
-        return "NEG: insufficient info"
-    if "insufficient" in s and "feedback" in s:
-        return "NEG: insufficient feedback"
-    if ("rarely" in s and "credit" in s) or ("rarely" in s and "good performance" in s):
-        return "NEG: rarely gives credit"
-    if ("rarely" in s and ("chance" in s or "chances" in s) and ("advance" in s or "improve" in s)):
-        return "NEG: rarely gives chances"
-
-    # fallback
-    return "OTHER"
-
-POS_TAGS = {
-    "POS: clear guidance",
-    "POS: continuous feedback",
-    "POS: recognition",
-    "POS: growth",
-}
-
-NEG_TAGS = {
-    "NEG: insufficient info",
-    "NEG: insufficient feedback",
-    "NEG: rarely gives credit",
-    "NEG: rarely gives chances",
-}
-
-
-def _find_col_by_keywords(df: pd.DataFrame, keywords_all: list[str]) -> str | None:
-    """Return first column whose header contains ALL keywords."""
-    if df is None or df.empty:
-        return None
-    keys = [_norm(k) for k in keywords_all]
-    for c in df.columns:
-        cn = _norm(c)
-        if all(k in cn for k in keys):
-            return c
-    return None
-
-def _yes_rate_from_keywords(df: pd.DataFrame, keywords_all: list[str]) -> tuple[float, str | None]:
-    """Compute %Yes for a Yes/No question found by keywords. Returns (rate, colname)."""
-    col = _find_col_by_keywords(df, keywords_all)
-    if not col:
-        return 0.0, None
-    s = df[col].astype(str).str.strip().str.lower()
-    yes = s.str.startswith(("yes", "y", "true", "1"))
-    no  = s.str.startswith(("no", "n", "false", "0"))
-    valid = yes | no
-    rate = float(yes[valid].mean()) if valid.sum() > 0 else 0.0
-    return rate, col
-
-def _scale_good_rate_from_keywords(df: pd.DataFrame, keywords_all: list[str], good_min: int = 4) -> tuple[float, str | None]:
-    """Compute % >= good_min for a 1–5 scale question found by keywords."""
-    col = _find_col_by_keywords(df, keywords_all)
-    if not col:
-        return 0.0, None
-    s = pd.to_numeric(df[col], errors="coerce")
-    valid = s.notna()
-    rate = float((s[valid] >= good_min).mean()) if valid.sum() > 0 else 0.0
-    return rate, col
-
-def _find_manager_name_col_emp(df: pd.DataFrame) -> str | None:
-    """
-    Detect the column in EMPLOYEE check-in that contains the manager name
-    (needed for Slide 12 grouping by manager).
-    """
-    if df is None or df.empty:
-        return None
-
-    # Prefer exact common labels if your cleaner standardizes them
-    for cand in [
-        "Manager Name",
-        "Direct Manager Name",
-        "Direct Manager",
-        "My Manager",
-        "Manager",
-        "Reporting Manager",
-        "Line Manager",
-    ]:
-        if cand in df.columns:
-            return cand
-
-    # Keyword-based fallback
-    for c in df.columns:
-        h = _norm(c)
-        if ("manager" in h) and ("name" in h or "direct" in h or "report" in h or "line" in h):
-            return c
-
-    # Last resort: any column containing 'manager'
-    for c in df.columns:
-        if "manager" in _norm(c):
-            return c
-
-    return None
-
-
-# --- Manager KPI helpers ---
-def _find_ready_for_promotion_col(df: pd.DataFrame) -> str | None:
-    # Adjust keywords if your header is slightly different
-    return _find_col_by_keywords(df, ["ready", "promotion"])
-
-def _find_employee_name_col(df: pd.DataFrame) -> str | None:
-    # common possibilities in cleaned files
-    for cand in ["Employee Name", "employee_name", "Name", "Full Name", "Employee"]:
-        if cand in df.columns:
-            return cand
-    # fallback: try keyword match
-    for c in df.columns:
-        h = _norm(c)
-        if ("employee" in h and "name" in h) or (h == "name") or ("full name" in h):
-            return c
-    return None
-
-def _find_subordinate_name_col(df: pd.DataFrame) -> str | None:
-    # Prefer exact cleaned canonical field
-    if df is None or df.empty:
-        return None
-    if "Subordinate Name" in df.columns:
-        return "Subordinate Name"
-    # Fallback: keyword-based detection
-    col = _find_col_by_keywords(df, ["subordinate", "name"])  # token match
-    if col:
-        return col
-    # Last resort: any column whose normalized header contains both tokens
-    for c in df.columns:
-        h = _norm(c)
-        if ("subordinate" in h) and ("name" in h):
-            return c
-    return None
-
-def _yes_mask(series: pd.Series) -> pd.Series:
-    s = series.astype(str).str.strip().str.lower()
-    return s.str.startswith(("yes", "y", "true", "1"))
-
-def _find_promo_position_col(df: pd.DataFrame) -> str | None:
-    # matches: "If yes, please state the position"
-    return _find_col_by_keywords(df, ["state", "position"]) or _find_col_by_keywords(df, ["position"])
-
-def _find_promo_review_date_col(df: pd.DataFrame) -> str | None:
-    # matches "suggest a date" / "review" / "consider promotion"
-    return (
-        _find_col_by_keywords(df, ["suggest", "date"]) or
-        _find_col_by_keywords(df, ["review", "date"]) or
-        _find_col_by_keywords(df, ["consider", "promotion"]) or
-        _find_col_by_keywords(df, ["promotion", "date"])
-    )
-
-def _no_mask(series: pd.Series) -> pd.Series:
-    s = series.astype(str).str.strip().str.lower()
-    return s.str.startswith(("no", "n", "false", "0"))
-
-# --------------------
-# Manager: At-Risk detail detection helpers
-# --------------------
-def _find_risk_reason_col(df: pd.DataFrame) -> str | None:
-    # Prefer exact header provided by user
-    exact = "If yes, please elaborate on the case"
-    if exact in df.columns:
-        return exact
-    # Fallback: explicit reason columns near risk context
-    col = _find_col_by_keywords(df, ["reason", "risk"]) or _find_col_by_keywords(df, ["reason"]) or _find_col_by_keywords(df, ["explain"]) or _find_col_by_keywords(df, ["incident"]) or _find_col_by_keywords(df, ["elaborate"]) 
-    # Ensure we don't pick yes/no fields
-    if col and _looks_like_yesno(df[col]):
-        col = None
-    return col
-
-def _find_pip_col(df: pd.DataFrame) -> str | None:
-    # Look for PIP indicator
-    for keys in (["pip"], ["performance", "improvement", "plan"], ["enroll", "pip"], ["should", "pip"]):
-        c = _find_col_by_keywords(df, keys)
-        if c:
-            return c
-    return None
-
-def _find_pip_reason_no_col(df: pd.DataFrame) -> str | None:
-    # Prefer exact header provided by user
-    exact = "If No, please elaborate"
-    if exact in df.columns:
-        return exact
-    # Reason if no PIP
-    for keys in (["reason", "if", "no"], ["if no", "reason"], ["why", "no", "pip"]):
-        c = _find_col_by_keywords(df, list(keys))
-        if c:
-            return c
-    # fallback to any elaboration column that mentions reason
-    for c in df.columns:
-        h = _norm(c)
-        if "reason" in h and ("if no" in h or "if your answer is no" in h or "if not" in h):
-            return c
-    return None
-
-def _parse_any_date(series: pd.Series) -> pd.Series:
-    """Parse dates robustly, handling text formats and Excel serial numbers.
-    Prefers month/day/year (dayfirst=False) and falls back to day-first only when needed.
-    Returns a datetime64[ns] Series with NaT where parsing fails.
-    """
-    if series is None or len(series) == 0:
-        return pd.to_datetime(pd.Series([], dtype=object))
-
-    raw = series.copy()
-    # First pass: month-first (MM/DD/YYYY)
-    dt_mf = pd.to_datetime(raw, errors="coerce", dayfirst=False)
-    # Second pass: day-first (DD/MM/YYYY) only where first failed
-    need_df = dt_mf.isna()
-    if need_df.any():
-        dt_df = pd.to_datetime(raw[need_df], errors="coerce", dayfirst=True)
-        dt_mf.loc[need_df] = dt_df
-
-    # Handle Excel serial numbers (days since 1899-12-30) only where still NaT
-    still_na = dt_mf.isna()
-    if still_na.any():
-        nums = pd.to_numeric(raw[still_na], errors="coerce")
-        mask_num = nums.notna()
-        if mask_num.any():
-            dt_mf.loc[still_na[still_na].index[mask_num]] = pd.to_datetime(
-                nums[mask_num], unit="d", origin="1899-12-30", errors="coerce"
-            )
-
-    return dt_mf
-
-def _extract_month_year_label(raw: pd.Series) -> pd.Series:
-    """Best-effort extraction of Month YYYY from raw date strings when parsing fails.
-    Handles cases like 'Dec 2025', 'December-2025', '12/15/2025', '12/2025', '12-25-25'.
-    Assumes month-first for numeric formats.
-    """
-    import calendar
-    def norm_year(y: int) -> int:
-        return 2000 + y if y < 100 else y
-
-    def to_label(m: int, y: int) -> str | None:
-        if 1 <= m <= 12 and y >= 1900:
-            return f"{calendar.month_name[m]} {y}"
-        return None
-
-    months = {
-        'jan':1,'january':1,'feb':2,'february':2,'mar':3,'march':3,'apr':4,'april':4,
-        'may':5,'jun':6,'june':6,'jul':7,'july':7,'aug':8,'august':8,
-        'sep':9,'sept':9,'september':9,'oct':10,'october':10,'nov':11,'november':11,'dec':12,'december':12
-    }
-
-    out = []
-    for v in raw.astype(str).fillna(""):
-        s = v.strip().lower()
-        label = None
-        if not s:
-            out.append(label)
-            continue
-        # Month name + year
-        m = re.search(r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b[\s\-_/]*([0-9]{2,4})", s)
-        if m:
-            mm = months.get(m.group(1), None)
-            yy = norm_year(int(m.group(2)))
-            label = to_label(mm, yy) if mm else None
-        if not label:
-            # MM/DD/YYYY or M/D/YY (assume month-first)
-            m2 = re.search(r"\b(\d{1,2})[\-/](\d{1,2})[\-/](\d{2,4})\b", s)
-            if m2:
-                mm = int(m2.group(1)); yy = norm_year(int(m2.group(3)))
-                label = to_label(mm, yy)
-        if not label:
-            # MM/YYYY
-            m3 = re.search(r"\b(\d{1,2})[\-/](\d{2,4})\b", s)
-            if m3:
-                mm = int(m3.group(1)); yy = norm_year(int(m3.group(2)))
-                label = to_label(mm, yy)
-        out.append(label)
-    return pd.Series(out, index=raw.index)
-
-# ------------------------------------------------------------
-# Identity + datatype detection helpers (Analysis)
-# ------------------------------------------------------------
-IDENTITY_HINTS = [
-    "timestamp", "email", "name", "department", "company", "manager", "subordinate"
-]
-
-def _is_identity_col(col_name: str) -> bool:
-    h = _norm(col_name)
-    return any(tok in h for tok in IDENTITY_HINTS)
-
-def _looks_like_yesno(series: pd.Series) -> bool:
-    if series is None or len(series) == 0:
-        return False
-    s = series.astype(str).str.strip().str.lower()
-    yes = s.str.startswith(("yes", "y", "true", "1"))
-    no  = s.str.startswith(("no", "n", "false", "0"))
-    valid = yes | no
-    # Consider it yes/no-like if a majority of non-empty values match yes/no
-    non_empty = s.ne("")
-    denom = max(int(non_empty.sum()), 1)
-    return int(valid.sum()) / denom >= 0.6
-
-def _count_yes_no(df: pd.DataFrame, col: str) -> tuple[int, int, float, float]:
-    """Returns (yes_count, no_count, yes_pct, no_pct) for a yes/no column."""
-    if not col or col not in df.columns:
-        return 0, 0, 0.0, 0.0
-    yes_mask = _yes_mask(df[col])
-    no_mask = _no_mask(df[col])
-    yes_count = int(yes_mask.sum())
-    no_count = int(no_mask.sum())
-    total = yes_count + no_count
-    yes_pct = (yes_count / total * 100) if total > 0 else 0.0
-    no_pct = (no_count / total * 100) if total > 0 else 0.0
-    return yes_count, no_count, yes_pct, no_pct
-
-def _looks_like_scale_1_5(series: pd.Series) -> bool:
-    """Check if a series looks like a 1-5 scale rating."""
-    if series is None or len(series) == 0:
-        return False
-    numeric = pd.to_numeric(series, errors='coerce')
-    non_null = numeric.dropna()
-    if len(non_null) == 0:
-        return False
-    # Check if most values are between 1 and 5
-    in_range = non_null.between(1, 5)
-    return int(in_range.sum()) / len(non_null) >= 0.6
-
-def _safe_percentage(numerator: int, denominator: int) -> float:
-    """Safely calculate percentage, returning 0 if denominator is 0."""
-    return (numerator / denominator * 100) if denominator > 0 else 0.0
-
-def _display_yes_no_metrics(df: pd.DataFrame, col: str, yes_label: str = "YES", no_label: str = "NO"):
-    """Display yes/no metrics in two columns with counts and percentages."""
-    yes_count, no_count, yes_pct, no_pct = _count_yes_no(df, col)
-    c1, c2 = st.columns(2)
-    c1.metric(yes_label, yes_count, f"{yes_pct:.1f}%")
-    c2.metric(no_label, no_count, f"{no_pct:.1f}%")
-    return yes_count, no_count
-
-# ============================================================
-# KPI metrics aggregator
-# ============================================================
-def _metrics(emp_df: pd.DataFrame, mgr_df: pd.DataFrame) -> dict:
-    kpi = KPIService()
-    stress_h = kpi.detect_stress_header(emp_df)
-    hr_h = kpi.detect_hr_pulse_header(emp_df)
-    risk_h = kpi.detect_manager_risk_header(mgr_df)
-    mgr_stress_h = kpi.detect_manager_stress_header(mgr_df)
-
-    return {
-        "emp_completion": kpi.employee_completion_rate_df(emp_df, expected_total=500),
-        "mgr_completion": kpi.manager_completion_rate_df(mgr_df, expected_total=30),
-        "emp_stress": (kpi.stress_rate(emp_df, stress_h) if stress_h else 0.0),
-        "hr_pulse": (kpi.hr_pulse_rate(emp_df, hr_h) if hr_h else 0.0),
-        "emp_at_risk": (
-            kpi.at_risk_employee_rate(
-                mgr_df, denominator="fixed", total_employees=500, risk_header=risk_h
-            ) if risk_h else 0.0
-        ),
-        "mgr_stress": (kpi.manager_stress_rate(mgr_df, mgr_stress_h) if mgr_stress_h else 0.0),
-    }
-
-# ============================================================
-# Department detection and filtering helpers
-# ============================================================
-def _find_dept_col(df: pd.DataFrame) -> str | None:
-    if df is None or df.empty:
-        return None
-    # Prefer exact label if present
-    for c in df.columns:
-        lc_raw = str(c)
-        lc = re.sub(r"\s+", " ", lc_raw).strip().lower().replace("\\", "/")
-        lc_nospace = lc.replace(" ", "")
-        if lc == "company name / department" or lc == "company name/department" or lc_nospace == "companyname/department":
-            return c
-    # Fallback: any header containing both tokens
-    for c in df.columns:
-        cn = re.sub(r"\s+", "", str(c).lower())
-        if "company" in cn and "department" in cn:
-            return c
-    return None
-
-def _norm_dept_value(x: str) -> str:
-    x = str(x or "").strip()
-    x = re.sub(r"\s+", " ", x)
-    return x
-
-def _filter_by_dept(df: pd.DataFrame, dept_col: str | None, selected: str) -> pd.DataFrame:
-    if df is None or df.empty or not dept_col or selected == "All departments":
-        return df
-    s = df[dept_col].astype(str).map(_norm_dept_value)
-    return df.loc[s == selected].copy()
-
-def _dept_options(*dfs: pd.DataFrame) -> list[str]:
-    vals = set()
-    for df in dfs:
-        if df is None or df.empty:
-            continue
-        # Prefer explicit known headers
-        c = None
-        if "Company Name / Department" in df.columns:
-            c = "Company Name / Department"
-        elif "Company Name/Department" in df.columns:
-            c = "Company Name/Department"
-        else:
-            c = _find_dept_col(df)
-
-        # Broader token-based detection as last resort
-        if not c:
-            for col in df.columns:
-                norm_col = re.sub(r"[^a-z]+", " ", str(col).lower())
-                if "company" in norm_col and "department" in norm_col:
-                    c = col
-                    break
-
-        if c:
-            vals |= set(df[c].dropna().astype(str).map(_norm_dept_value).unique().tolist())
-    vals = {v for v in vals if v.strip()}
-    return ["All departments"] + sorted(vals)
-
-
-# --------------------
-# Check-in frequency helpers (used in Employee & Manager and Compare sections)
-# --------------------
-def _find_checkin_freq_col_emp(df: pd.DataFrame) -> str | None:
-    return _find_col_by_keywords(df, ["had", "check", "in", "meeting", "with", "my", "manager"]) or \
-        _find_col_by_keywords(df, ["check", "in", "meeting", "my", "manager"])
-
-def _find_checkin_freq_col_mgr(df: pd.DataFrame) -> str | None:
-    return _find_col_by_keywords(df, ["had", "check", "in", "meeting", "with", "this", "person"]) or \
-        _find_col_by_keywords(df, ["check", "in", "meeting", "this", "person"])
-
-FREQ_CATS = ["Weekly", "Monthly", "Few", "Zero"]
-
-def _norm_freq(x: str) -> str:
-    s = _norm(x)
-    if "week" in s:
-        return "Weekly"
-    if "month" in s:
-        return "Monthly"
-    if "few" in s:
-        return "Few"
-    if "zero" in s or s == "0":
-        return "Zero"
-    return "Unknown"
-
-
-# --------------------
-# KPI maps (keyword-based)
-# --------------------
-EMP_YN_KPIS = [
-    ("Discussed professional goals", ["discuss", "professional", "goals"]),
-    ("Tasks aligned with growth", ["tasks", "aligned", "growth"]),
-    ("Manager considers input", ["seek", "consider", "input"]),
-    ("Collaborative culture", ["culture", "collaborative", "support"]),
-    ("Recommend company", ["recommend", "company"]),
-    ("Job requirements changed", ["encountered", "changes", "job", "requirements"]),
-   # ("HR pulse requested", ["pulse", "check", "hr"]),
-]
-
-EMP_SCALE_KPIS = [
-    ("Adapted well (4–5)", ["able", "adapt", "job", "requirements"], 4),
-]
-
-
-# ============================================================
-# YoY 
-# ============================================================
-def _find_data_candidates(base: Path) -> list[Path]:
-    data_dir = base / "Data"
-    exts = {".xlsx", ".xls", ".csv"}
-    found: list[Path] = []
-    if data_dir.exists():
-        for p in data_dir.rglob("*"):
-            if p.is_file() and p.suffix.lower() in exts and not p.name.startswith("~$"):
-                found.append(p)
-    return found
-
-def _classify_year_files(paths: list[Path]) -> dict[int, dict[str, Path]]:
-    by_year: dict[int, dict[str, Path]] = {}
-    for p in paths:
-        name = p.name.lower()
-
-        years_in_name = [int(m) for m in re.findall(r"\b(20\d{2})\b", p.name)]
-        yr = years_in_name[-1] if years_in_name else None
-        if yr is None:
-            years_in_path = [int(m) for m in re.findall(r"\b(20\d{2})\b", str(p))]
-            yr = years_in_path[-1] if years_in_path else None
-        if yr is None:
-            continue
-
-        toks = name.replace("-", " ").replace("_", " ").split()
-        def any_has(*kw):
-            return any(any(k in t for t in toks) for k in kw)
-
-        if any_has("manager") and any_has("check", "checkin", "check-ins"):
-            by_year.setdefault(yr, {})["mgr"] = p
-            continue
-        if any_has("employee") and any_has("check", "checkin", "check-ins"):
-            by_year.setdefault(yr, {})["emp"] = p
-            continue
-        if ("performance" in name) and any_has("check", "checkin", "check-ins") and not any_has("employee"):
-            by_year.setdefault(yr, {})["mgr"] = p
-            continue
-
-    return by_year
-
-
-def _available_years_from_data(base_path: Path) -> tuple[list[int], dict[int, dict[str, Path]]]:
-    paths = _find_data_candidates(base_path)
-    by_year = _classify_year_files(paths)
-    years = sorted([y for y in by_year.keys() if "emp" in by_year[y] and "mgr" in by_year[y]])
-    return years, by_year
-
-@st.cache_data(show_spinner=True)
-def _load_and_clean_year_from_data(year: int) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Returns: (cleaned_emp, cleaned_mgr, combined) for the selected year
-    """
-    base_path = Path(os.getcwd())
-    years, by_year = _available_years_from_data(base_path)
-
-    if year not in by_year or "emp" not in by_year[year] or "mgr" not in by_year[year]:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-    df_mena = _load_static_mena()
-    if df_mena.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-    def _read_any(p: Path) -> pd.DataFrame:
-        if p.suffix.lower() == ".csv":
-            return pd.read_csv(str(p))
-        return pd.read_excel(str(p), engine="openpyxl")
-
-
-    emp_raw = _read_any(by_year[year]["emp"])
-    mgr_raw = _read_any(by_year[year]["mgr"])
-
-    cleaner = CheckInExcelCleaner()
-    cleaned_emp = cleaner.clean_employee_checkin(emp_raw, df_mena)
-    cleaned_mgr = cleaner.clean_manager_checkin(mgr_raw, df_mena)
-    combined = cleaner.combine_cleaned(cleaned_emp, cleaned_mgr)
-
-    return cleaned_emp, cleaned_mgr, combined
-
-
-# ============================================================
-# Shared helpers
-# ============================================================
-def _download_fig_png(fig, filename: str, key: str):
-    if fig is None:
-        st.caption("No chart to download.")
-        return
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
-    buf.seek(0)
-    st.download_button(
-        label="⬇️ Download Chart (PNG)",
-        data=buf,
-        file_name=filename,
-        mime="image/png",
-        use_container_width=True,
-        key=key,
-    )
-
-
-def _download_df_csv(df: pd.DataFrame, filename: str, key: str):
-    """Download a dataframe as CSV."""
-    if df is None or df.empty:
-        st.caption("No data to download.")
-        return
-    st.download_button(
-        label="⬇️ Download CSV",
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name=filename,
-        mime="text/csv",
-        use_container_width=True,
-        key=key,
-    )
-
-def _download_fig_png(fig, filename: str, key: str):
-    """Download a matplotlib figure as PNG."""
-    if fig is None:
-        st.caption("No chart to download.")
-        return
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
-    buf.seek(0)
-    st.download_button(
-        label="⬇️ Download Chart (PNG)",
-        data=buf,
-        file_name=filename,
-        mime="image/png",
-        use_container_width=True,
-        key=key,
-    )
-
-
-RES_ORDER = [
-    "Enrolling in the group's wellness sessions",
-    "Seeking advice from HR",
-    "Expressing complaints or miscellaneous ideas",
-    "Other",
-    "Not Applicable",
-]
-
-def _norm_resource_opt(x: str) -> str | None:
-    s = _norm(x)
-
-    if "wellness" in s or ("group" in s and "wellness" in s):
-        return "Enrolling in the group's wellness sessions"
-    if "seeking" in s and "advice" in s and "hr" in s:
-        return "Seeking advice from HR"
-    if "complaint" in s or ("miscellaneous" in s and "idea" in s):
-        return "Expressing complaints or miscellaneous ideas"
-    if "not applicable" in s:
-        return "Not Applicable"
-    if "other" in s:
-        return "Other"
-
-    return None
-
-def _find_company_resources_col_emp(df: pd.DataFrame) -> str | None:
-    # Your exact header:
-    # "What company resources or practices do I use to ease and facilitate my experience within the work culture?"
-    for c in df.columns:
-        h = _norm(c)
-        if ("company resources" in h or "resources" in h) and ("work culture" in h) and ("ease" in h or "facilitate" in h):
-            return c
-    # fallback
-    for c in df.columns:
-        h = _norm(c)
-        if ("resources" in h) and ("work culture" in h):
-            return c
-    return None
-
-def _find_resources_other_text_col_emp(df: pd.DataFrame) -> str | None:
-    # tries to find the follow-up text for "Other"
-    for c in df.columns:
-        h = _norm(c)
-        if ("other" in h) and ("specify" in h or "please specify" in h):
-            return c
-    return None
-
-
-PULSE_REASON_ORDER = [
-    "To discuss career path",
-    "To address challenges faced",
-    "Compensation & Benefits concern",
-    "To address personal issues",
-    "To share ideas and insights with HR",
-]
-
-def _find_pulse_yn_col_emp(df: pd.DataFrame) -> str | None:
-    # The big header text you mentioned contains "pulse check meeting"
-    for c in df.columns:
-        h = _norm(c)
-        if "pulse check" in h and "meeting" in h:
-            return c
-    return None
-
-def _find_pulse_reason_col_emp(df: pd.DataFrame) -> str | None:
-    for c in df.columns:
-        if _norm(c).startswith("if answered yes please specify the reason"):
-            return c
-    return None
-
-
-def _norm_pulse_reason(x: str) -> str | None:
-    s = _norm(x)
-    if "career" in s and "path" in s:
-        return "To discuss career path"
-    if "challenge" in s:
-        return "To address challenges faced"
-    if "compensation" in s or ("benefit" in s):
-        return "Compensation & Benefits concern"
-    if "personal" in s:
-        return "To address personal issues"
-    if ("share" in s and "idea" in s) or ("insight" in s and "hr" in s):
-        return "To share ideas and insights with HR"
-    return None
-
-def _pulse_reason_counts(series: pd.Series) -> pd.Series:
-    items: list[str] = []
-    for v in series.dropna().astype(str):
-        for part in re.split(r"[,\|;\n]+", v):
-            p = part.strip()
-            if not p:
-                continue
-            k = _norm_pulse_reason(p)
-            if k:
-                items.append(k)
-    vc = pd.Series(items).value_counts()
-    return vc.reindex(PULSE_REASON_ORDER, fill_value=0)
-
-
-EMP_STRESS_REASON_ORDER = [
-    "Personal",
-    "Unrealistic Goals",
-    "Tight Deadlines",
-    "Workload",
-    "Relationship with manager",
-    "Relationship with team members",
-    "Others",
-]
-
-def _norm_emp_stress_reason(x: str) -> str | None:
-    s = _norm(x)
-
-    if "personal" in s:
-        return "Personal"
-    if "unrealistic" in s and "goal" in s:
-        return "Unrealistic Goals"
-    if "tight" in s and "deadline" in s:
-        return "Tight Deadlines"
-    if "workload" in s:
-        return "Workload"
-    if "relationship" in s and "manager" in s:
-        return "Relationship with manager"
-    if "relationship" in s and ("team members" in s or "team" in s):
-        return "Relationship with team members"
-    if "other" in s:
-        return "Others"
-
-    return None
-
-def _find_emp_stress_reasons_col(df: pd.DataFrame) -> str | None:
-    # "In your opinion, what are the reasons behind this stress?"
-    for c in df.columns:
-        h = _norm(c)
-        if ("reasons" in h) and ("behind" in h) and ("stress" in h):
-            return c
-    for c in df.columns:
-        h = _norm(c)
-        if ("reasons" in h) and ("stress" in h):
-            return c
-    return None
-
-def _find_mgr_stress_freq_col(df: pd.DataFrame) -> str | None:
-    for c in df.columns:
-        h = _norm(c)
-        if ("frequently" in h or "frequency" in h) and ("reflect stress" in h or ("stress" in h and "employee" in h)):
-            return c
-    # fallback: stress + frequent
-    for c in df.columns:
-        h = _norm(c)
-        if ("stress" in h) and ("frequent" in h):
-            return c
-    return None
-
-def _find_mgr_stress_reasons_col(df: pd.DataFrame) -> str | None:
-    for c in df.columns:
-        h = _norm(c)
-        if ("reasons" in h) and ("behind" in h) and ("stress" in h):
-            return c
-    # fallback: reasons + stress
-    for c in df.columns:
-        h = _norm(c)
-        if ("reasons" in h) and ("stress" in h):
-            return c
-    return None
-
-MGR_STRESS_REASON_ORDER = [
-    "Workload",
-    "Tight Deadlines",
-    "Personal",
-    "Unrealistic Goals",
-    "Relationship with manager",
-    "Relationship with team members",
-    "Others",
-]
-
-def _norm_mgr_stress_reason(x: str) -> str | None:
-    s = _norm(x)
-    if "workload" in s:
-        return "Workload"
-    if "tight" in s and "deadline" in s:
-        return "Tight Deadlines"
-    if "personal" in s:
-        return "Personal"
-    if "unrealistic" in s and "goal" in s:
-        return "Unrealistic Goals"
-    if "relationship" in s and "manager" in s:
-        return "Relationship with manager"
-    if "relationship" in s and ("team members" in s or "team" in s):
-        return "Relationship with team members"
-    if "other" in s:
-        return "Others"
-    return None
-
-def _stress_reason_counts(series: pd.Series) -> pd.Series:
-    items: list[str] = []
-    for v in series.dropna().astype(str):
-        for part in re.split(r"[,\|;\n]+", v):
-            p = part.strip()
-            if not p:
-                continue
-            k = _norm_mgr_stress_reason(p)
-            if k:
-                items.append(k)
-    vc = pd.Series(items).value_counts()
-    return vc.reindex(MGR_STRESS_REASON_ORDER, fill_value=0)
-
-
-STRESS_FREQ_ORDER = ["Less frequent", "Frequent", "Extremely frequent"]
-
-def _norm_stress_freq(x: str) -> str:
-    s = _norm(x)
-    if "less" in s and "frequent" in s:
-        return "Less frequent"
-    if s.startswith("frequent") or ("frequent" in s and "extreme" not in s):
-        return "Frequent"
-    if "extreme" in s and "frequent" in s:
-        return "Extremely frequent"
-    return "Unknown"
-
-def _find_stress_freq_col_emp(df: pd.DataFrame) -> str | None:
-    for c in df.columns:
-        h = _norm(c)
-        if ("rate" in h) and ("stress" in h) and ("frequency" in h):
-            return c
-    for c in df.columns:
-        h = _norm(c)
-        if ("stress levels" in h) and ("frequency" in h):
-            return c
-    return None
-
-def _find_stress_reason_col_emp(df: pd.DataFrame) -> str | None:
-    # best-effort: looks for follow-up reason wording
-    for c in df.columns:
-        h = _norm(c)
-        if ("elaborate" in h or "reason" in h or "why" in h) and ("stress" in h):
-            return c
-    # fallback: any column mentioning stress + open ended
-    for c in df.columns:
-        h = _norm(c)
-        if "stress" in h and ("elabor" in h or "reason" in h):
-            return c
-    return None
-
-
-MGR_DYNAMICS_ORDER = [
-    "Having Clear and Transparent Communication",
-    "Having a positive influence on the team",
-    "Being trustful",
-    "Abiding by defined roles and responsibilities",
-    "Adopting a healthy conflict resolution approach",
-    "Collaborating and supporting the team",
-    "Not applicable",
-]
-
-def _norm_mgr_dynamics_opt(x: str) -> str | None:
-    s = _norm(x)
-
-    if "clear" in s and "transparent" in s and "communication" in s:
-        return "Having Clear and Transparent Communication"
-    if "collabor" in s and ("support" in s or "team" in s):
-        return "Collaborating and supporting the team"
-    if "healthy" in s and "conflict" in s:
-        return "Adopting a healthy conflict resolution approach"
-    if ("abiding" in s or "defined" in s) and ("roles" in s or "responsibil" in s):
-        return "Abiding by defined roles and responsibilities"
-    if "trust" in s:
-        return "Being trustful"
-    if "positive" in s and "influence" in s:
-        return "Having a positive influence on the team"
-    if "not applicable" in s or s == "na":
-        return "Not applicable"
-
-    return None
-
-def _mgr_dynamics_counts(series: pd.Series) -> pd.Series:
-    items: list[str] = []
-    for v in series.dropna().astype(str):
-        for part in re.split(r"[,\|;\n]+", v):
-            p = part.strip()
-            if not p:
-                continue
-            k = _norm_mgr_dynamics_opt(p)
-            if k:
-                items.append(k)
-    vc = pd.Series(items).value_counts()
-    return vc.reindex(MGR_DYNAMICS_ORDER, fill_value=0)
-
-def _find_mgr_dynamics_col_mgr(df: pd.DataFrame) -> str | None:
-    # "This member contributes to enhance the department dynamics by"
-    for c in df.columns:
-        h = _norm(c)
-        if ("contributes" in h) and ("department dynamics" in h) and ("enhance" in h or "enhancement" in h):
-            return c
-    # fallback: dynamics + contributes
-    for c in df.columns:
-        h = _norm(c)
-        if ("dynamics" in h) and ("contribut" in h):
-            return c
-    return None
-
-
-DYNAMICS_ORDER = [
-    "Clear & Transparent Communication",
-    "Team Collaboration",
-    "Healthy Conflict Resolution",
-    "Defined Responsibilities",
-    "Trust",
-    "Negative Influence",
-    "Not Applicable",
-]
-
-def _norm_dynamics_opt(x: str) -> str | None:
-    s = _norm(x)
-
-    if "clear" in s and "transparent" in s and "communication" in s:
-        return "Clear & Transparent Communication"
-    if "team" in s and ("collaboration" in s or "support" in s):
-        return "Team Collaboration"
-    if "healthy" in s and "conflict" in s:
-        return "Healthy Conflict Resolution"
-    if ("defined" in s or "organized" in s) and ("roles" in s or "responsibil" in s):
-        return "Defined Responsibilities"
-    if "trust" in s:
-        return "Trust"
-    if "negative" in s and "influence" in s:
-        return "Negative Influence"
-    if "not applicable" in s or s == "na":
-        return "Not Applicable"
-
-    return None
-
-def _dynamics_counts(series: pd.Series) -> pd.Series:
-    items: list[str] = []
-    for v in series.dropna().astype(str):
-        for part in re.split(r"[,\|;\n]+", v):
-            p = part.strip()
-            if not p:
-                continue
-            k = _norm_dynamics_opt(p)
-            if k:
-                items.append(k)
-    vc = pd.Series(items).value_counts()
-    return vc.reindex(DYNAMICS_ORDER, fill_value=0)
-
-def _find_dynamics_col_emp(df: pd.DataFrame) -> str | None:
-    # "In what 3 areas do you believe that the department dynamics need enhancement"
-    for c in df.columns:
-        h = _norm(c)
-        if ("department dynamics" in h) and ("enhancement" in h or "enhance" in h) and ("3 areas" in h or "in what 3" in h):
-            return c
-    # fallback: dynamics + enhancement
-    for c in df.columns:
-        h = _norm(c)
-        if ("dynamics" in h) and ("enhance" in h or "enhancement" in h):
-            return c
-    return None
-
-
-WORK_CULTURE_ORDER = [
-    "Clan Culture",
-    "Hierarchy Culture",
-    "Innovative Culture",
-    "Market Driven Culture",
-    "Purpose Driven Culture",
-    "Creative Culture",
-    "Adhocracy Culture",
-    "Customer Focus Culture",
-]
-
-def _norm_work_culture_opt(x: str) -> str | None:
-    s = _norm(x)
-
-    if "clan" in s:
-        return "Clan Culture"
-    if "hierarchy" in s:
-        return "Hierarchy Culture"
-    if "innov" in s:
-        return "Innovative Culture"
-    if "market" in s and "driven" in s:
-        return "Market Driven Culture"
-    if "purpose" in s and "driven" in s:
-        return "Purpose Driven Culture"
-    if "creative" in s:
-        return "Creative Culture"
-    if "adhocracy" in s:
-        return "Adhocracy Culture"
-    if "customer" in s and "focus" in s:
-        return "Customer Focus Culture"
-
-    return None
-
-def _work_culture_counts(series: pd.Series) -> pd.Series:
-    items: list[str] = []
-    for v in series.dropna().astype(str):
-        for part in re.split(r"[,\|;\n]+", v):
-            p = part.strip()
-            if not p:
-                continue
-            k = _norm_work_culture_opt(p)
-            if k:
-                items.append(k)
-    vc = pd.Series(items).value_counts()
-    return vc.reindex(WORK_CULTURE_ORDER, fill_value=0)
-
-
-TEAM_INTEGRATION_ORDER = [
-    "Well integrated with the team",
-    "Indifferent with the team",
-    "Detached from the team",
-]
-
-def _norm_team_integration(x: str) -> str:
-    s = _norm(x)
-    if "well" in s and "integr" in s:
-        return "Well integrated with the team"
-    if "indifferent" in s:
-        return "Indifferent with the team"
-    if "detached" in s:
-        return "Detached from the team"
-    return "Unknown"
-
-def _find_team_integration_col_emp(df: pd.DataFrame) -> str | None:
-    return _find_col_by_keywords(df, ["team", "integration", "i", "am"]) or \
-           _find_col_by_keywords(df, ["team", "integration"])
-
-def _find_team_integration_col_mgr(df: pd.DataFrame) -> str | None:
-    return _find_col_by_keywords(df, ["team", "integration", "this", "person"]) or \
-           _find_col_by_keywords(df, ["team", "integration"])
-
-
-MISTAKE_ORDER = [
-    "Private Discussion",
-    "Immediate Correction",
-    "Immediate Confrontation",
-    "Blame Approach",
-    "Address Cause of The Problem",
-    "Constructive Criticism",
-    "Direct Escalation",
-]
-
-UNDESIRED = {"Immediate Confrontation", "Blame Approach"}
-
-def _norm_mistake_opt(x: str) -> str | None:
-    s = _norm(x)
-
-    if "private" in s and "discuss" in s:
-        return "Private Discussion"
-    if "immediate" in s and "correct" in s:
-        return "Immediate Correction"
-    if "immediate" in s and "confront" in s:
-        return "Immediate Confrontation"
-    if "blame" in s:
-        return "Blame Approach"
-    if ("root" in s or "cause" in s) and ("problem" in s):
-        return "Address Cause of The Problem"
-    if "construct" in s and "critic" in s:
-        return "Constructive Criticism"
-    if "direct" in s and "escalat" in s:
-        return "Direct Escalation"
-
-    return None
-
-def _mistake_counts(series: pd.Series) -> pd.Series:
-    items: list[str] = []
-    for v in series.dropna().astype(str):
-        for part in re.split(r"[,\|;\n]+", v):
-            p = part.strip()
-            if not p:
-                continue
-            k = _norm_mistake_opt(p)
-            if k:
-                items.append(k)
-    vc = pd.Series(items).value_counts()
-    return vc.reindex(MISTAKE_ORDER, fill_value=0)
-
-
-def _find_input_seek_col_emp(df: pd.DataFrame) -> str | None:
-    # Employee: "Does your manager actively seek and consider your input..."
-    return _find_col_by_keywords(df, ["actively", "seek", "consider", "input", "department"]) or \
-           _find_col_by_keywords(df, ["seek", "consider", "input"])
-
-def _find_input_seek_col_mgr(df: pd.DataFrame) -> str | None:
-    # Manager: "Do you actively seek and consider your team members’ input?"
-    return _find_col_by_keywords(df, ["actively", "seek", "consider", "team", "members", "input"]) or \
-           _find_col_by_keywords(df, ["seek", "consider", "team", "input"]) or \
-           _find_col_by_keywords(df, ["seek", "consider", "input"])
-
-
-RECOG_ORDER = [
-    "Sending a recognition e-mail",
-    "Providing continuous positive feedback",
-    "Offering a wider scope of responsibilities",
-    "Announcing it publicly",
-    "Offering incentives",
-]
-
-def _norm_recog_opt(x: str) -> str | None:
-    s = _norm(x)
-    if "not applicable" in s or s == "na" or s == "n a":
-        return None
-
-    if "recognition" in s and ("mail" in s or "email" in s or "e mail" in s or "e-mail" in s):
-        return "Sending a recognition e-mail"
-    if "continuous" in s and "positive" in s and "feedback" in s:
-        return "Providing continuous positive feedback"
-    if ("wider" in s or "scope" in s) and "responsibil" in s:
-        return "Offering a wider scope of responsibilities"
-    if "announc" in s and ("public" in s or "publicly" in s):
-        return "Announcing it publicly"
-    if "incentive" in s or "incentives" in s:
-        return "Offering incentives"
-
-    # If the text doesn't match, return None so it doesn't pollute the table
-    return None
-
-def _recog_counts(series: pd.Series) -> pd.Series:
-    items: list[str] = []
-    for v in series.dropna().astype(str):
-        for part in re.split(r"[,\|;\n]+", v):
-            p = part.strip()
-            if not p:
-                continue
-            k = _norm_recog_opt(p)
-            if k:
-                items.append(k)
-
-    counts = pd.Series(items).value_counts()
-    return counts.reindex(RECOG_ORDER, fill_value=0)
-
-
-def _find_job_change_yn_col_emp(df: pd.DataFrame) -> str | None:
-    # employee: "During the year 2025, I encountered changes in my job requirements"
-    return _find_col_by_keywords(df, ["encountered", "changes", "job", "requirements"])
-
-def _find_job_change_yn_col_mgr(df: pd.DataFrame) -> str | None:
-    # manager: "During the Year 2025, this person encountered changes in his/her job requirements"
-    return _find_col_by_keywords(df, ["this", "person", "encountered", "changes", "job", "requirements"]) or \
-           _find_col_by_keywords(df, ["encountered", "changes", "job", "requirements"])
-
-def _find_job_change_types_col(df: pd.DataFrame) -> str | None:
-    # both forms: "If yes, what changes did ... encounter"
-    return _find_col_by_keywords(df, ["if", "yes", "what", "changes"]) or _find_col_by_keywords(df, ["what", "changes", "encounter"])
-
-def _split_multiselect(v: str) -> list[str]:
-    if pd.isna(v):
-        return []
-    s = str(v).strip()
-    if not s:
-        return []
-    parts = re.split(r"[,\|;\n]+", s)
-    return [p.strip() for p in parts if p.strip()]
-
-def _multiselect_counts(series: pd.Series) -> pd.DataFrame:
-    items = []
-    for v in series.dropna().astype(str):
-        items.extend(_split_multiselect(v))
-    if not items:
-        return pd.DataFrame(columns=["Option", "Count"])
-    vc = pd.Series(items).value_counts()
-    return vc.rename_axis("Option").reset_index(name="Count")
-
-CHANGE_CATS = [
-    "Change in management",
-    "Transfer to another department",
-    "Shift in role",
-    "Added responsibilities",
-    "Promotion",
-    "Other",
-]
-
-def _norm_change_option(x: str) -> str:
-    s = str(x or "").strip().lower()
-    s = re.sub(r"\s+", " ", s)
-
-    if "promotion" in s:
-        return "Promotion"
-    if "added" in s and "respons" in s:
-        return "Added responsibilities"
-    if "shift" in s and "role" in s:
-        return "Shift in role"
-    if "transfer" in s and "department" in s:
-        return "Transfer to another department"
-    if "change" in s and "management" in s:
-        return "Change in management"
-    if "other" in s:
-        return "Other"
-    return "Other"
-
-def _change_counts(series: pd.Series) -> pd.Series:
-    items = []
-    for v in series.dropna().astype(str):
-        for part in re.split(r"[,\|;\n]+", v):
-            p = part.strip()
-            if p:
-                items.append(_norm_change_option(p))
-
-    counts = pd.Series(items).value_counts()
-    # ensure all categories exist
-    return counts.reindex(CHANGE_CATS, fill_value=0)
-
-
-def _completion_stats(sent: int, received: int) -> dict:
-    sent = int(max(sent, 0))
-    received = int(max(received, 0))
-    received = min(received, sent) if sent > 0 else received  # avoid >100%
-    pending = max(sent - received, 0)
-    completion = (received / sent * 100.0) if sent > 0 else 0.0
-    pending_pct = (pending / sent * 100.0) if sent > 0 else 0.0
-    return {
-        "sent": sent,
-        "received": received,
-        "pending": pending,
-        "completion": completion,
-        "pending_pct": pending_pct,
-    }
-
-
-def _pct(x: float) -> str:
-    try:
-        return f"{float(x) * 100:.1f}%"
-    except Exception:
-        return "0.0%"
-
-def _scale_counts_1_5(df: pd.DataFrame, col: str | None) -> dict[int, int]:
-    if df is None or df.empty or not col or col not in df.columns:
-        return {i: 0 for i in range(1, 6)}
-    s = pd.to_numeric(df[col], errors="coerce")
-    counts = s.value_counts(dropna=True).to_dict()
-    return {i: int(counts.get(i, 0)) for i in range(1, 6)}
-
-def _add_year_from_timestamp(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-
-    candidates = ["Timestamp", "timestamp", "Submission Timestamp", "Submitted at", "Date", "date"]
-    ts_col = None
-    for c in candidates:
-        if c in df.columns:
-            ts_col = c
-            break
-    if ts_col is None:
-        for c in df.columns:
-            if "timestamp" in str(c).lower():
-                ts_col = c
-                break
-
-    df = df.copy()
-    if ts_col is None:
-        df["Year"] = pd.NA
-        return df
-
-    ts = pd.to_datetime(df[ts_col], errors="coerce", infer_datetime_format=True)
-    df["Year"] = ts.dt.year
-    return df
-
-
-# ============================================================
-# Department helpers
-# ============================================================
-# Keyword matching helpers (KPIs + Analysis)
-# ============================================================
-
-def _best_topic_for_text(text: str) -> tuple[str, int]:
-    """
-    Assign EACH text to only ONE best topic.
-    Returns (topic, score). If no keywords match -> ("Uncategorized", 0)
-    """
-    t = (text or "").lower()
-
-    best_topic = "Uncategorized"
-    best_score = 0
-
-    # tie-breaker: earlier topic in TOPIC_BUCKETS wins if same score
-    for topic, kws in TOPIC_BUCKETS.items():
-        score = sum(1 for k in kws if k in t)
-        if score > best_score:
-            best_topic = topic
-            best_score = score
-
-    return best_topic, best_score
-
-
-def _topic_summary_with_sentiment(texts: list[str]) -> pd.DataFrame:
-    """
-    Improvements:
-    - Each answer counted in ONLY ONE topic (best keyword-hit topic)
-    - Adds Uncategorized
-    - Adds Example neutral
-    - Removes Avg sentiment (keeps only counts)
-    """
-    total = len(texts)
-
-    # Assign each text to one topic
-    buckets: dict[str, list[str]] = {topic: [] for topic in TOPIC_BUCKETS.keys()}
-    buckets["Uncategorized"] = []
-
-    for txt in texts:
-        topic, score = _best_topic_for_text(txt)
-        buckets[topic].append(txt)
-
-    rows = []
-    for topic in list(TOPIC_BUCKETS.keys()) + ["Uncategorized"]:
-        matched = buckets.get(topic, [])
-        if not matched:
-            rows.append([topic, 0, 0.0, 0, 0, 0, "", "", ""])
-            continue
-
-        scores = [_sentiment_score(t) for t in matched]
-        labels = [_sentiment_label(s) for s in scores]
-
-        neg = sum(1 for l in labels if l == "Negative")
-        neu = sum(1 for l in labels if l == "Neutral")
-        pos = sum(1 for l in labels if l == "Positive")
-
-        neg_examples = [t[:160] for t, l in zip(matched, labels) if l == "Negative"][:2]
-        neu_examples = [t[:160] for t, l in zip(matched, labels) if l == "Neutral"][:2]
-        pos_examples = [t[:160] for t, l in zip(matched, labels) if l == "Positive"][:2]
-
-        pct_responses = (len(matched) / total * 100.0) if total else 0.0
-
-        rows.append([
-            topic,
-            len(matched),
-            round(pct_responses, 1),
-            neg,
-            neu,
-            pos,
-            " | ".join(neg_examples),
-            " | ".join(neu_examples),
-            " | ".join(pos_examples),
-        ])
-
-    df = pd.DataFrame(rows, columns=[
-        "Topic",
-        "Mentions",
-        "% of responses",
-        "Negative",
-        "Neutral",
-        "Positive",
-        "Example negative",
-        "Example neutral",
-        "Example positive",
-    ])
-
-    # Sort by most mentioned first
-    return df.sort_values(["Mentions", "% of responses"], ascending=[False, False])
-
-
-# ============================================================
-# Optional: Convert "Reasons for No" topics into Action Plan
-# ============================================================
-TOPIC_ACTIONS = {
-    "Workload & Pressure": [
-        "Review workload distribution and deadline pressure; identify overload peaks.",
-        "Agree on top priorities and remove/shift non-essential tasks."
-    ],
-    "Tools & Systems": [
-        "Collect tool/system pain points and prioritize fixes with IT (access, slowness, bugs).",
-        "Provide quick training / cheat-sheets for the main tools used."
-    ],
-    "Process & Approvals": [
-        "Map approval bottlenecks and simplify steps or set clear SLAs.",
-        "Clarify ownership + escalation path when requests are blocked."
-    ],
-    "Communication": [
-        "Set a consistent feedback cadence (e.g., monthly 1:1) and align expectations.",
-        "Share clearer priorities/goals and confirm understanding."
-    ],
-    "Management & Leadership": [
-        "Coach managers on support/recognition and reduce micromanagement patterns.",
-        "Standardize 1:1 agenda templates (goals, blockers, development)."
-    ],
-    "Culture & Team": [
-        "Improve collaboration norms (handoffs, retros, rules of engagement).",
-        "Address repeated conflict patterns through HR/leadership intervention."
-    ],
-    "Career & Growth": [
-        "Introduce a simple development plan template (skills, goals, next steps).",
-        "Clarify career paths and training options; track follow-ups."
-    ],
-    "Compensation & Benefits": [
-        "Collect themes and benchmark; communicate what’s feasible and timeline.",
-        "If changes aren’t possible, improve transparency and alternatives."
-    ],
-    "Wellbeing & Stress": [
-        "Promote wellbeing resources and encourage time-off planning.",
-        "Reduce stress drivers via workload/process fixes; monitor trends."
-    ],
-}
-
-def _reasons_action_plan(texts: list[str]) -> pd.DataFrame:
-    total = len(texts)
-    rows = []
-
-    for topic, kws in TOPIC_BUCKETS.items():
-        matched = [t for t in texts if any(k in t.lower() for k in kws)]
-        if not matched:
-            continue
-
-        scores = [_sentiment_score(t) for t in matched]
-        labels = [_sentiment_label(s) for s in scores]
-        neg = sum(1 for l in labels if l == "Negative")
-        neu = sum(1 for l in labels if l == "Neutral")
-        pos = sum(1 for l in labels if l == "Positive")
-
-        pct = (len(matched) / total * 100.0) if total else 0.0
-        avg_sent = float(sum(scores) / len(scores)) if scores else 0.0
-
-        examples = [t[:140] for t in matched][:2]
-        actions = TOPIC_ACTIONS.get(topic, ["Review and address this theme."])
-
-        rows.append({
-            "Theme": topic,
-            "% of No elaborations": round(pct, 1),
-            "Mentions": len(matched),
-            "Avg sentiment (-1..1)": round(avg_sent, 3),
-            "Negative": neg,
-            "Neutral": neu,
-            "Positive": pos,
-            "Recommended actions": " • ".join(actions[:2]),
-            "Example snippets": " | ".join(examples)
-        })
-
-    if not rows:
-        return pd.DataFrame(columns=[
-            "Theme","% of No elaborations","Mentions","Avg sentiment (-1..1)",
-            "Negative","Neutral","Positive","Recommended actions","Example snippets"
-        ])
-
-    return pd.DataFrame(rows).sort_values(
-        ["Mentions", "Avg sentiment (-1..1)"], ascending=[False, True]
-    )
-
-# ============================================================
-# "Reasons for No" pairing helpers
-# ============================================================
-ELAB_NO_KEYWORDS = ["if no", "if answered no", "if you answered no", "if not", "if your answer is no"]
-
-def _is_elaboration_header(col_name: str) -> bool:
-    h = _norm(col_name)
-
-    # exclude YES follow-ups
-    if "if yes" in h or "if answered yes" in h or "if you answered yes" in h:
-        return False
-
-    # exclude non-no followups like "indifferent/detached" or numeric followups
-    if "indifferent" in h or "detached" in h:
-        return False
-    if "if answered 1" in h or "1 or 2" in h:
-        return False
-
-    # ✅ only accept if it explicitly refers to NO
-    return any(k in h for k in ELAB_NO_KEYWORDS)
-
-
-def _is_yesno_series(series: pd.Series) -> bool:
-    return _looks_like_yesno(series)
-
-def _shorten_header(h: str, max_len: int = 70) -> str:
-    h = str(h).replace("\n", " ").strip()
-    h = re.sub(r"\s+", " ", h)
-    return (h[:max_len] + "…") if len(h) > max_len else h
-
-def _build_reasons_for_no_pairs(df: pd.DataFrame) -> list[dict]:
-    cols = list(df.columns)
-    pairs = []
-    for i, c in enumerate(cols):
-        if not _is_elaboration_header(c):
-            continue
-        parent = None
-        for j in range(i - 1, -1, -1):
-            cj = cols[j]
-            if _is_elaboration_header(cj):
-                continue
-            if _is_yesno_series(df[cj]):
-                parent = cj
-                break
-        if parent:
-            label = f"Reasons for No — {_shorten_header(parent)}"
-            count = sum(1 for p in pairs if p["label"].startswith(label))
-            if count > 0:
-                label = f"{label} ({count+1})"
-
-            pairs.append({
-                "label": label,
-                "parent_col": parent,
-                "elab_col": c
-            })
-
-    return pairs
-
 
 # ============================================================
 # Session state init
@@ -1698,70 +214,81 @@ def _load_df(file) -> pd.DataFrame:
     return pd.read_excel(bio)
 
 
-def _clean_text(x: str) -> str:
-    x = str(x)
-    x = re.sub(r"\b[\w\.-]+@[\w\.-]+\.\w+\b", "[email]", x)
-    x = re.sub(r"\s+", " ", x).strip()
-    return x
+def _find_data_candidates(base: Path) -> list[Path]:
+    data_dir = base / "Data"
+    exts = {".xlsx", ".xls", ".csv"}
+    found: list[Path] = []
+    if data_dir.exists():
+        for p in data_dir.rglob("*"):
+            if p.is_file() and p.suffix.lower() in exts and not p.name.startswith("~$"):
+                found.append(p)
+    return found
 
 
-def _detect_open_ended_columns(df: pd.DataFrame) -> list[str]:
-    cols: list[str] = []
-    if df is None or df.empty:
-        return cols
+def _classify_year_files(paths: list[Path]) -> dict[int, dict[str, Path]]:
+    by_year: dict[int, dict[str, Path]] = {}
+    for p in paths:
+        name = p.name.lower()
 
-    for c in df.columns:
-        if _is_identity_col(c):
+        years_in_name = [int(m) for m in re.findall(r"\b(20\d{2})\b", p.name)]
+        yr = years_in_name[-1] if years_in_name else None
+        if yr is None:
+            years_in_path = [int(m) for m in re.findall(r"\b(20\d{2})\b", str(p))]
+            yr = years_in_path[-1] if years_in_path else None
+        if yr is None:
             continue
 
-        s = df[c]
+        toks = name.replace("-", " ").replace("_", " ").split()
+        def any_has(*kw):
+            return any(any(k in t for t in toks) for k in kw)
 
-        # exclude yes/no and 1–5 scale columns
-        if _looks_like_yesno(s) or _looks_like_scale_1_5(s):
+        if any_has("manager") and any_has("check", "checkin", "check-ins"):
+            by_year.setdefault(yr, {})["mgr"] = p
+            continue
+        if any_has("employee") and any_has("check", "checkin", "check-ins"):
+            by_year.setdefault(yr, {})["emp"] = p
+            continue
+        if ("performance" in name) and any_has("check", "checkin", "check-ins") and not any_has("employee"):
+            by_year.setdefault(yr, {})["mgr"] = p
             continue
 
-        if s.dtype == object:
-            vals = s.dropna().astype(str)
-            if vals.empty:
-                continue
-
-            avg_len = vals.map(len).mean()
-            uniq_ratio = vals.nunique() / max(len(vals), 1)
-
-            # heuristic: open-ended tends to have longer + more unique responses
-            if avg_len >= 20 and uniq_ratio >= 0.25:
-                cols.append(c)
-
-    return cols
+    return by_year
 
 
-# -------------------------
-# Sentiment helpers (VADER)
-# -------------------------
-_analyzer = SentimentIntensityAnalyzer()
-
-def _sentiment_score(text: str) -> float:
-    return _analyzer.polarity_scores(str(text))["compound"]
-
-def _sentiment_label(score: float) -> str:
-    if score <= -0.05:
-        return "Negative"
-    if score >= 0.05:
-        return "Positive"
-    return "Neutral"
+def _available_years_from_data(base_path: Path) -> tuple[list[int], dict[int, dict[str, Path]]]:
+    paths = _find_data_candidates(base_path)
+    by_year = _classify_year_files(paths)
+    years = sorted([y for y in by_year.keys() if "emp" in by_year[y] and "mgr" in by_year[y]])
+    return years, by_year
 
 
-def _tokenize(text: str) -> list[str]:
-    text = str(text).lower()
-    text = re.sub(r"[^a-z0-9\s]", " ", text)
-    return [t for t in text.split() if len(t) >= 3 and t not in STOPWORDS]
+@st.cache_data(show_spinner=True)
+def _load_and_clean_year_from_data(year: int) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Returns: (cleaned_emp, cleaned_mgr, combined) for the selected year."""
+    base_path = Path(os.getcwd())
+    years, by_year = _available_years_from_data(base_path)
 
-def _top_keywords(texts: list[str], top_n: int = 25) -> pd.DataFrame:
-    counter = Counter()
-    for t in texts:
-        counter.update(_tokenize(t))
-    most = counter.most_common(top_n)
-    return pd.DataFrame(most, columns=["Keyword", "Count"])
+    if year not in by_year or "emp" not in by_year[year] or "mgr" not in by_year[year]:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    df_mena = _load_static_mena()
+    if df_mena.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    def _read_any(p: Path) -> pd.DataFrame:
+        if p.suffix.lower() == ".csv":
+            return pd.read_csv(str(p))
+        return pd.read_excel(str(p), engine="openpyxl")
+
+    emp_raw = _read_any(by_year[year]["emp"])
+    mgr_raw = _read_any(by_year[year]["mgr"])
+
+    cleaner = CheckInExcelCleaner()
+    cleaned_emp = cleaner.clean_employee_checkin(emp_raw, df_mena)
+    cleaned_mgr = cleaner.clean_manager_checkin(mgr_raw, df_mena)
+    combined = cleaner.combine_cleaned(cleaned_emp, cleaned_mgr)
+
+    return cleaned_emp, cleaned_mgr, combined
 
 
 def _analysis_ui(df_raw: pd.DataFrame, who: str, year: int | None = None):
@@ -1944,6 +471,133 @@ def _analysis_ui(df_raw: pd.DataFrame, who: str, year: int | None = None):
         df_keywords = _top_keywords(row_texts, top_n=25)
         st.dataframe(df_keywords, use_container_width=True, hide_index=True)
         _download_df_csv(df_keywords, "top_keywords.csv", key="dl_top_keywords")
+
+
+# ============================================================
+# Shared: Auto-detect check-in files for YoY comparison
+# ============================================================
+_CHECKIN_BASE = Path("Data/Check-ins 2024 2025")
+
+def _auto_load_checkin_files() -> dict:
+    """Auto-detect the latest two years of check-in files."""
+    files_info: dict = {}
+
+    if not _CHECKIN_BASE.exists():
+        return files_info
+
+    year_dirs = sorted(
+        [d for d in _CHECKIN_BASE.iterdir() if d.is_dir() and d.name.isdigit()],
+        reverse=True,
+    )
+    if len(year_dirs) < 2:
+        return files_info
+
+    y2_dir = year_dirs[0]
+    y2 = int(y2_dir.name)
+    y1_dir = year_dirs[1]
+    y1 = int(y1_dir.name)
+
+    def _find_files(directory):
+        emp, mgr = None, None
+        for f in directory.glob("*.xlsx"):
+            if f.name.startswith("~$"):
+                continue
+            fname_lower = f.name.lower()
+            if ("employee answers" in fname_lower or "employee questions" in fname_lower) and "performance check-in" in fname_lower:
+                emp = f
+            elif ("manager answers" in fname_lower or "manager questions" in fname_lower) and "performance check-in" in fname_lower:
+                mgr = f
+        return emp, mgr
+
+    emp_y2, mgr_y2 = _find_files(y2_dir)
+    emp_y1, mgr_y1 = _find_files(y1_dir)
+
+    return {
+        "y1": y1, "y2": y2,
+        "emp_y1": emp_y1, "mgr_y1": mgr_y1,
+        "emp_y2": emp_y2, "mgr_y2": mgr_y2,
+    }
+
+
+def _run_comparison(auto_files: dict | None = None) -> None:
+    """Run the YoY comparison pipeline and store results in session state.
+    Called by the KPI Run button so both sections update together.
+    """
+    st.session_state.yoy_ready = False
+    st.session_state.yoy_payload = None
+
+    if auto_files is None:
+        auto_files = _auto_load_checkin_files()
+
+    # Resolve files: prefer any manual uploads stored in session, else auto-detected
+    use_emp_y1 = st.session_state.get("compare_emp_y1") or (auto_files.get("emp_y1") if auto_files else None)
+    use_mgr_y1 = st.session_state.get("compare_mgr_y1") or (auto_files.get("mgr_y1") if auto_files else None)
+    use_emp_y2 = st.session_state.get("compare_emp_y2") or (auto_files.get("emp_y2") if auto_files else None)
+    use_mgr_y2 = st.session_state.get("compare_mgr_y2") or (auto_files.get("mgr_y2") if auto_files else None)
+
+    if not (use_emp_y1 and use_mgr_y1 and use_emp_y2 and use_mgr_y2):
+        # Not enough files — silently skip (no error when auto-detecting)
+        return
+
+    df_mena = _load_static_mena()
+    if df_mena.empty:
+        return
+
+    try:
+        cleaner = CheckInExcelCleaner()
+
+        def _load_file(file_or_path):
+            if isinstance(file_or_path, Path):
+                return pd.read_excel(file_or_path) if file_or_path.suffix in ['.xlsx', '.xls'] else pd.read_csv(file_or_path)
+            return _load_df(file_or_path)
+
+        emp1 = _load_file(use_emp_y1)
+        mgr1 = _load_file(use_mgr_y1)
+        emp2 = _load_file(use_emp_y2)
+        mgr2 = _load_file(use_mgr_y2)
+
+        # Detect years from timestamp columns
+        emp1_w_year = _add_year_from_timestamp(emp1)
+        emp2_w_year = _add_year_from_timestamp(emp2)
+
+        y1_emp = emp1_w_year["Year"].dropna().mode()[0] if "Year" in emp1_w_year.columns and not emp1_w_year["Year"].dropna().empty else "Year 1"
+        y2_emp = emp2_w_year["Year"].dropna().mode()[0] if "Year" in emp2_w_year.columns and not emp2_w_year["Year"].dropna().empty else "Year 2"
+
+        y1 = int(y1_emp) if isinstance(y1_emp, (int, float)) else y1_emp
+        y2 = int(y2_emp) if isinstance(y2_emp, (int, float)) else y2_emp
+
+        emp1_c = cleaner.clean_employee_checkin(emp1, df_mena)
+        mgr1_c = cleaner.clean_manager_checkin(mgr1, df_mena)
+        emp2_c = cleaner.clean_employee_checkin(emp2, df_mena)
+        mgr2_c = cleaner.clean_manager_checkin(mgr2, df_mena)
+
+        m1 = _metrics(emp1_c, mgr1_c)
+        m2 = _metrics(emp2_c, mgr2_c)
+
+        kpi = KPIService()
+        risk_h1 = kpi.detect_manager_risk_header(mgr1_c)
+        risk_h2 = kpi.detect_manager_risk_header(mgr2_c)
+
+        def _at_risk_rows(mgr_df, risk_col):
+            if mgr_df is None or mgr_df.empty or not risk_col or risk_col not in mgr_df.columns:
+                return pd.DataFrame()
+            s = mgr_df[risk_col].astype(str).str.strip().str.lower()
+            mask = s.str.startswith(("yes", "y", "true", "1"))
+            return mgr_df[mask].copy()
+
+        risk_df_y1 = _at_risk_rows(mgr1_c, risk_h1)
+        risk_df_y2 = _at_risk_rows(mgr2_c, risk_h2)
+
+        st.session_state.yoy_ready = True
+        st.session_state.yoy_payload = {
+            "y1": y1, "y2": y2,
+            "m1": m1, "m2": m2,
+            "risk_y1": risk_df_y1, "risk_y2": risk_df_y2,
+            "emp1_c": emp1_c, "mgr1_c": mgr1_c,
+            "emp2_c": emp2_c, "mgr2_c": mgr2_c,
+        }
+    except Exception:
+        pass  # Comparison silently skipped if it fails
 
 
 # ============================================================
@@ -2191,56 +845,6 @@ if section == "KPIs":
         emp_f = _filter_by_dept(emp_tmp, emp_dept_col, selected_dept)
         mgr_f = _filter_by_dept(mgr_tmp, mgr_dept_col, selected_dept)
 
-        divider()
-        section_title("Completion Rate (manual inputs)")
-
-        # Make keys unique per year+dept view so it doesn't mix inputs
-        ctx = f"{selected_year}_{selected_dept}"
-        ctx_key = re.sub(r"[^a-zA-Z0-9_]", "_", str(ctx))
-
-
-        cA, cB = st.columns(2)
-
-        with cA:
-            st.subheader("Managers")
-            sent_mgr = st.number_input("Sent to Managers", min_value=0, step=1, key=f"sent_mgr_{ctx_key}")
-            rec_mgr  = st.number_input("Received from Managers", min_value=0, step=1, key=f"rec_mgr_{ctx_key}")
-
-        with cB:
-            st.subheader("Employees")
-            sent_emp = st.number_input("Sent to Employees", min_value=0, step=1, key=f"sent_emp_{ctx_key}")
-            rec_emp  = st.number_input("Received from Employees", min_value=0, step=1, key=f"rec_emp_{ctx_key}")
-
-        mgr = _completion_stats(sent_mgr, rec_mgr)
-        emp = _completion_stats(sent_emp, rec_emp)
-
-        divider()
-
-        left, right = st.columns(2)
-
-        with left:
-            st.markdown(
-                f"**The organization has received a {mgr['completion']:.0f}% completion rate from Managers.**"
-            )
-            st.markdown(
-                f"**{mgr['sent']} FORMS**"
-            )
-            k1, k2 = st.columns(2)
-            k1.metric("Closed", f"{mgr['completion']:.0f}%", mgr["received"])
-            k2.metric("Pending", f"{mgr['pending_pct']:.0f}%", mgr["pending"])
-
-        with right:
-            st.markdown(
-                f"**The organization has received a {emp['completion']:.0f}% completion rate from Employees.**"
-            )
-            st.markdown(
-                f"**{emp['sent']} FORMS**"
-            )
-            k1, k2 = st.columns(2)
-            k1.metric("Closed", f"{emp['completion']:.0f}%", emp["received"])
-            k2.metric("Pending", f"{emp['pending_pct']:.0f}%", emp["pending"])
-
-
         # --- KPIs on filtered data ---
         m = _metrics(emp_f, mgr_f)
 
@@ -2437,14 +1041,14 @@ if section == "KPIs":
 
                 # Names of employees who answered NO
                 if no_count > 0:
-                    name_col = "Your Name"
-                    if name_col in emp_f.columns:
+                    name_col = _find_your_name_col(emp_f)
+                    if name_col and name_col in emp_f.columns:
                         no_names = emp_f.loc[no_mask, name_col].astype(str).fillna("").str.strip()
                         no_names = [n for n in no_names.tolist() if n]
                         if no_names:
                             st.caption(", ".join(no_names))
                     else:
-                        st.caption("Employee name column 'Your Name' not found to list NO responders.")
+                        st.caption("Employee name column not found to list NO responders.")
 
             divider()
             section_title("Enhancing Department Dynamics — Employees (Slide 21)")
@@ -2476,6 +1080,7 @@ if section == "KPIs":
 
 
             divider()
+            section_title("Employee Stress")
             with st.expander("Stress — Employees (Slide 23)", expanded=True):
                 tab1, tab2 = st.tabs(["Frequency", "Reasons (Who mentioned what)"])
 
@@ -2519,15 +1124,15 @@ if section == "KPIs":
                 # Tab 2: Reasons table
                 # -------------------------
                 with tab2:
-                    reason_col = _find_emp_stress_reasons_col(emp_f)
-                    name_col = "Your Name"
+                    reason_col = _find_stress_reasons_col(emp_f)
+                    name_col = _find_your_name_col(emp_f)
 
                     if not reason_col:
                         st.info("Could not detect the stress reasons multi-select question in employee data.")
-                    elif name_col not in emp_f.columns:
-                        st.info("Employee name column 'Your Name' not found in employee data.")
+                    elif not name_col or name_col not in emp_f.columns:
+                        st.info("Employee name column not found in employee data.")
                     else:
-                        reason_to_names: dict[str, set[str]] = {k: set() for k in EMP_STRESS_REASON_ORDER}
+                        reason_to_names: dict[str, set[str]] = {k: set() for k in STRESS_REASON_ORDER}
 
                         for _, r in emp_f[[name_col, reason_col]].iterrows():
                             emp_name = str(r[name_col]).strip()
@@ -2536,12 +1141,12 @@ if section == "KPIs":
 
                             picks = _split_multiselect(r[reason_col])
                             for p in picks:
-                                k = _norm_emp_stress_reason(p)
+                                k = _norm_stress_reason(p)
                                 if k:
                                     reason_to_names[k].add(emp_name)
 
                         rows = []
-                        for reason in EMP_STRESS_REASON_ORDER:
+                        for reason in STRESS_REASON_ORDER:
                             names = sorted(reason_to_names.get(reason, set()))
                             if not names:
                                 continue
@@ -2559,6 +1164,7 @@ if section == "KPIs":
 
 
             divider()
+            section_title("Pulse-Check Meeting")
             with st.expander("Pulse-Check Meeting (Slide 26)", expanded=False):
                 pulse_col = _find_pulse_yn_col_emp(emp_f)
                 reason_col = _find_pulse_reason_col_emp(emp_f)
@@ -2603,12 +1209,12 @@ if section == "KPIs":
 
             res_col = _find_company_resources_col_emp(emp_f)
             other_text_col = _find_resources_other_text_col_emp(emp_f)
-            name_col = "Your Name"
+            name_col = _find_your_name_col(emp_f)
 
             if not res_col:
                 st.info("Could not detect the Company Resources question column in employee data.")
-            elif name_col not in emp_f.columns:
-                st.info("Employee name column 'Your Name' not found in employee data.")
+            elif not name_col or name_col not in emp_f.columns:
+                st.info("Employee name column not found in employee data.")
             else:
                 counts = {k: 0 for k in RES_ORDER}
                 other_entries = []
@@ -3015,7 +1621,7 @@ if section == "KPIs":
             section_title("Stress Frequency — Managers (Slide 24)")
 
             freq_col = _find_mgr_stress_freq_col(mgr_f)
-            reason_col = _find_mgr_stress_reasons_col(mgr_f)
+            reason_col = _find_stress_reasons_col(mgr_f)
 
             if not freq_col:
                 st.info("Could not detect the manager stress frequency question in manager data.")
@@ -3254,7 +1860,7 @@ if section == "KPIs":
                     ax.set_yticklabels(FREQ_CATS)
                     ax.invert_yaxis()
                     ax.set_xlabel("% of responses")
-                    ax.set_title("Check-ins meeting frequency (2025)")
+                    ax.set_title(f"Check-ins meeting frequency ({selected_year})")
                     ax.legend()
                     st.pyplot(fig, clear_figure=False)
                     _download_fig_png(fig, "checkins_meeting_frequency.png", key="dl_meeting_freq_png")
@@ -3343,13 +1949,13 @@ if section == "KPIs":
                 mgr_q = _find_input_seek_col_mgr(mgr_f)
 
                 # ✅ Use employee names on BOTH sides
-                emp_name_col = "Your Name"          # employee file
-                mgr_name_col = "Subordinate Name"   # manager file
+                emp_name_col = _find_your_name_col(emp_f)
+                mgr_name_col = _find_subordinate_name_col(mgr_f) or "Subordinate Name"
 
                 if not emp_q or not mgr_q:
                     st.info("Could not detect the input-seeking Yes/No question in employee or manager data.")
-                elif emp_name_col not in emp_f.columns:
-                    st.info("Employee name column 'Your Name' not found in employee data.")
+                elif not emp_name_col or emp_name_col not in emp_f.columns:
+                    st.info("Employee name column not found in employee data.")
                 elif mgr_name_col not in mgr_f.columns:
                     st.info("Employee name column 'Subordinate Name' not found in manager data.")
                 else:
@@ -3446,16 +2052,15 @@ if section == "KPIs":
                     with right:
                         st.markdown("**Employees**")
 
-                        # These must exist exactly as you told me in the previous slide:
-                        emp_employee_name_col = "Your Name"
+                        emp_employee_name_col = _find_your_name_col(emp_f)
 
                         # Manager name column in employee check-in (if your cleaned file uses something else, replace it)
                         emp_manager_name_col = _find_manager_name_col_emp(emp_f)
 
                         if not emp_manager_name_col:
                             st.caption("Manager name column not detected in employee data, so we cannot list 'mentioned by' cases.")
-                        elif emp_employee_name_col not in emp_f.columns:
-                            st.caption("Employee name column 'Your Name' not found in employee data.")
+                        elif not emp_employee_name_col or emp_employee_name_col not in emp_f.columns:
+                            st.caption("Employee name column not found in employee data.")
                         else:
                             tmp = emp_f[[emp_employee_name_col, emp_manager_name_col, emp_col]].copy()
 
@@ -3520,78 +2125,15 @@ if section == "KPIs":
                         st.caption(f"{mgr_pct:.0f}%")
 
 
-elif section == "Analysis":
-    section_title("Analysis")
-    divider()
-    st.info("Analysis section is reserved for future use.")
-
-
 # -------------------------
 # SECTION: Compare 2 Years
 # -------------------------
 elif section == "Compare":
     divider()
     section_title("Year-over-Year Comparison")
-    
-    # Auto-detect and load check-in files from Data folder
-    checkin_base = Path("Data/Check-ins 2024 2025")
-    
-    def _auto_load_checkin_files():
-        """Auto-detect the latest two years of check-in files."""
-        files_info = {}
-        
-        if checkin_base.exists():
-            # Look for year subdirectories
-            year_dirs = sorted([d for d in checkin_base.iterdir() if d.is_dir() and d.name.isdigit()], reverse=True)
-            
-            if len(year_dirs) >= 2:
-                # Latest year (Year 2)
-                y2_dir = year_dirs[0]
-                y2 = int(y2_dir.name)
-                
-                # Previous year (Year 1)
-                y1_dir = year_dirs[1]
-                y1 = int(y1_dir.name)
-                
-                # Find employee and manager files for Year 2
-                emp_y2 = None
-                mgr_y2 = None
-                for f in y2_dir.glob("*.xlsx"):
-                    # Skip temporary Excel files (start with ~$)
-                    if f.name.startswith("~$"):
-                        continue
-                    fname_lower = f.name.lower()
-                    if "employee answers" in fname_lower or "employee questions" in fname_lower and "performance check-in" in fname_lower:
-                        emp_y2 = f
-                    elif "manager answers" in fname_lower or "manager questions" in fname_lower and "performance check-in" in fname_lower:
-                        mgr_y2 = f
-                
-                # Find employee and manager files for Year 1
-                emp_y1 = None
-                mgr_y1 = None
-                for f in y1_dir.glob("*.xlsx"):
-                    # Skip temporary Excel files (start with ~$)
-                    if f.name.startswith("~$"):
-                        continue
-                    fname_lower = f.name.lower()
-                    if "employee answers" in fname_lower or "employee questions" in fname_lower and "performance check-in" in fname_lower:
-                        emp_y1 = f
-                    elif "manager answers" in fname_lower or "manager questions" in fname_lower and "performance check-in" in fname_lower:
-                        mgr_y1 = f
-                
-                files_info = {
-                    "y1": y1,
-                    "y2": y2,
-                    "emp_y1": emp_y1,
-                    "mgr_y1": mgr_y1,
-                    "emp_y2": emp_y2,
-                    "mgr_y2": mgr_y2,
-                }
-        
-        return files_info
-    
+
     auto_files = _auto_load_checkin_files()
-    
+
     # Show auto-detected files info
     if auto_files and all([auto_files.get("emp_y1"), auto_files.get("mgr_y1"), auto_files.get("emp_y2"), auto_files.get("mgr_y2")]):
         st.success(f"✅ Auto-detected files for {auto_files['y1']} vs {auto_files['y2']} comparison")
@@ -3615,115 +2157,42 @@ elif section == "Compare":
         )
 
         col1, col2 = st.columns(2)
-        
+
         with col1:
             st.subheader("Year 1 (Earlier)")
-            emp_file_y1 = st.file_uploader(
+            st.file_uploader(
                 "Employee Check-In (Year 1)",
                 type=["xlsx", "xls", "csv"],
                 key="compare_emp_y1",
             )
-            mgr_file_y1 = st.file_uploader(
+            st.file_uploader(
                 "Manager Check-In (Year 1)",
                 type=["xlsx", "xls", "csv"],
                 key="compare_mgr_y1",
             )
-        
+
         with col2:
             st.subheader("Year 2 (Later)")
-            emp_file_y2 = st.file_uploader(
+            st.file_uploader(
                 "Employee Check-In (Year 2)",
                 type=["xlsx", "xls", "csv"],
                 key="compare_emp_y2",
             )
-            mgr_file_y2 = st.file_uploader(
+            st.file_uploader(
                 "Manager Check-In (Year 2)",
                 type=["xlsx", "xls", "csv"],
                 key="compare_mgr_y2",
             )
 
-    compare_btn = st.button("Run Comparison", type="primary", use_container_width=True)
+    compare_run_btn = st.button("Run Comparison", type="primary", use_container_width=True, key="compare_run_btn")
 
-    if compare_btn:
+    if compare_run_btn:
         st.session_state.yoy_ready = False
         st.session_state.yoy_payload = None
+        _run_comparison(auto_files)
 
-        df_mena = _load_static_mena()
-        if df_mena.empty:
-            st.error("Mena Report file not found in Data/ or root. Place 'Mena Report.xlsx' before comparing.")
-        else:
-            # Use auto-detected files if manual uploads are not provided
-            use_emp_y1 = emp_file_y1 if emp_file_y1 else (auto_files.get("emp_y1") if auto_files else None)
-            use_mgr_y1 = mgr_file_y1 if mgr_file_y1 else (auto_files.get("mgr_y1") if auto_files else None)
-            use_emp_y2 = emp_file_y2 if emp_file_y2 else (auto_files.get("emp_y2") if auto_files else None)
-            use_mgr_y2 = mgr_file_y2 if mgr_file_y2 else (auto_files.get("mgr_y2") if auto_files else None)
-            
-            if not (use_emp_y1 and use_mgr_y1 and use_emp_y2 and use_mgr_y2):
-                st.error("Please upload all four files (Employee + Manager for both years) or ensure auto-detection found all files.")
-            else:
-                try:
-                    cleaner = CheckInExcelCleaner()
-
-                    # Load dataframes - handle both file paths and uploaded files
-                    def _load_file(file_or_path):
-                        if isinstance(file_or_path, Path):
-                            return pd.read_excel(file_or_path) if file_or_path.suffix in ['.xlsx', '.xls'] else pd.read_csv(file_or_path)
-                        else:
-                            return _load_df(file_or_path)
-                    
-                    emp1 = _load_file(use_emp_y1)
-                    mgr1 = _load_file(use_mgr_y1)
-                    emp2 = _load_file(use_emp_y2)
-                    mgr2 = _load_file(use_mgr_y2)
-
-                    # Detect years from timestamp columns
-                    emp1_w_year = _add_year_from_timestamp(emp1)
-                    emp2_w_year = _add_year_from_timestamp(emp2)
-                    
-                    y1_emp = emp1_w_year["Year"].dropna().mode()[0] if "Year" in emp1_w_year.columns and not emp1_w_year["Year"].dropna().empty else "Year 1"
-                    y2_emp = emp2_w_year["Year"].dropna().mode()[0] if "Year" in emp2_w_year.columns and not emp2_w_year["Year"].dropna().empty else "Year 2"
-                    
-                    y1 = int(y1_emp) if isinstance(y1_emp, (int, float)) else y1_emp
-                    y2 = int(y2_emp) if isinstance(y2_emp, (int, float)) else y2_emp
-
-                    st.info(f"Cleaning Year 1 ({y1})…")
-                    emp1_c = cleaner.clean_employee_checkin(emp1, df_mena)
-                    mgr1_c = cleaner.clean_manager_checkin(mgr1, df_mena)
-
-                    st.info(f"Cleaning Year 2 ({y2})…")
-                    emp2_c = cleaner.clean_employee_checkin(emp2, df_mena)
-                    mgr2_c = cleaner.clean_manager_checkin(mgr2, df_mena)
-
-                    m1 = _metrics(emp1_c, mgr1_c)
-                    m2 = _metrics(emp2_c, mgr2_c)
-
-                    kpi = KPIService()
-                    risk_h1 = kpi.detect_manager_risk_header(mgr1_c)
-                    risk_h2 = kpi.detect_manager_risk_header(mgr2_c)
-
-                    def _at_risk_rows(mgr_df: pd.DataFrame, risk_col: str | None) -> pd.DataFrame:
-                        if mgr_df is None or mgr_df.empty or not risk_col or risk_col not in mgr_df.columns:
-                            return pd.DataFrame()
-                        s = mgr_df[risk_col].astype(str).str.strip().str.lower()
-                        mask = s.str.startswith(("yes", "y", "true", "1"))
-                        return mgr_df[mask].copy()
-
-                    risk_df_y1 = _at_risk_rows(mgr1_c, risk_h1)
-                    risk_df_y2 = _at_risk_rows(mgr2_c, risk_h2)
-
-                    st.session_state.yoy_ready = True
-                    st.session_state.yoy_payload = {
-                        "y1": y1, "y2": y2,
-                        "m1": m1, "m2": m2,
-                        "risk_y1": risk_df_y1, "risk_y2": risk_df_y2,
-                        "emp1_c": emp1_c, "mgr1_c": mgr1_c,
-                        "emp2_c": emp2_c, "mgr2_c": mgr2_c,
-                    }
-                    st.success("Comparison ready! ✅")
-
-                except Exception as e:
-                    st.error(f"Comparison failed: {e}")
-                    st.exception(e)
+    if not st.session_state.yoy_ready:
+        st.info("💡 Click **Run Comparison** above to load and compare year-over-year data.")
 
     if st.session_state.yoy_ready and st.session_state.yoy_payload:
         y1 = st.session_state.yoy_payload["y1"]
@@ -3778,7 +2247,7 @@ elif section == "Compare":
         # Detailed comparison tabs
         view_tab = st.radio(
             "Select comparison view",
-            options=["� Employee Insights", "👔 Manager Insights", "🔄 Combined Analysis"],
+            options=["👥 Employee Insights", "👔 Manager Insights", "🔄 Combined Analysis"],
             horizontal=True,
             key="yoy_view_tab",
         )

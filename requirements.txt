@@ -2,13 +2,6 @@ pandas
 openpyxl
 streamlit
 numpy
-python-pptx
 vaderSentiment
 matplotlib
 xlrd>=2.0.1
-sentence-transformers
-plotly
-wordcloud
-rapidfuzz
-scikit-learn
-pypdf
