@@ -117,22 +117,63 @@ class CheckInExcelCleaner:
             newly = need_fallback & mapped['__Mena_Employee_Name__'].notna()
             mapped.loc[newly, 'Match Source'] = 'LocalPart'
 
+        # Fallback 2: try "Email Address" column if it exists and differs from primary email col
+        alt_email_col = next((c for c in pc.columns if c.strip().lower() == 'email address'), None)
+        if alt_email_col and alt_email_col != email_col:
+            still_missing = mapped['__Mena_Employee_Name__'].isna()
+            if still_missing.any():
+                mapped['__alt_email__'] = self._norm_email(mapped[alt_email_col])
+                # Exact match on alt email
+                fb2 = mapped[still_missing].merge(
+                    mena_small[['Email', '__Mena_Employee_Name__']].drop_duplicates('Email'),
+                    left_on='__alt_email__', right_on='Email', how='left', suffixes=('_orig', '_alt')
+                )
+                alt_name_col = '__Mena_Employee_Name___alt' if '__Mena_Employee_Name___alt' in fb2.columns else '__Mena_Employee_Name__'
+                mapped.loc[still_missing, '__Mena_Employee_Name__'] = fb2[alt_name_col].values
+                newly2 = still_missing & mapped['__Mena_Employee_Name__'].notna()
+                mapped.loc[newly2, 'Match Source'] = 'AltEmail'
+                # If still missing, try local-part of alt email
+                still_missing2 = mapped['__Mena_Employee_Name__'].isna()
+                if still_missing2.any():
+                    mapped['__alt_email_key__'] = self._email_key(mapped['__alt_email__'])
+                    fb3 = mapped[still_missing2].merge(
+                        mena_small[['EmailKey', '__Mena_Employee_Name__']].drop_duplicates('EmailKey'),
+                        left_on='__alt_email_key__', right_on='EmailKey', how='left', suffixes=('_orig2', '_alt2')
+                    )
+                    alt2_col = '__Mena_Employee_Name___alt2' if '__Mena_Employee_Name___alt2' in fb3.columns else '__Mena_Employee_Name__'
+                    mapped.loc[still_missing2, '__Mena_Employee_Name__'] = fb3[alt2_col].values
+                    newly3 = still_missing2 & mapped['__Mena_Employee_Name__'].notna()
+                    mapped.loc[newly3, 'Match Source'] = 'AltEmailLocalPart'
+                mapped = mapped.drop(columns=[c for c in ['__alt_email__', '__alt_email_key__'] if c in mapped.columns])
+
         mapped['Mena Name'] = mapped['__Mena_Employee_Name__']
+        # Coalesce: fall back to original name when Mena Name is NaN (unmatched)
+        mapped['Mena Name'] = mapped['Mena Name'].fillna(mapped[name_col])
         out = mapped.drop(columns=[c for c in ['__email__', 'Email', 'EmailKey', '__email_key__', '__Mena_Employee_Name__'] if c in mapped.columns])
         return out
 
-    def clean_manager_checkin(self, df_epc: pd.DataFrame, df_mena: pd.DataFrame) -> pd.DataFrame:
+    def clean_manager_checkin(
+        self,
+        df_epc: pd.DataFrame,
+        df_mena: pd.DataFrame,
+        df_emp_cleaned: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        """Clean manager check-in using Mena Report + cleaned employee check-in.
+
+        1. Fix Subordinate Name: match to employee check-in's Mena Name
+           (canonical full name), with Mena direct lookup as fallback.
+        2. Add Name on Mena: manager's own canonical name from Mena
+           (join manager's Your Work Email Address → Mena Email → Employee Name).
+        """
         epc = df_epc.copy()
         mena = self._prepare_mena(df_mena)
 
-        # Find an email-like column in epc
+        # --- helper: find email column ---
         def find_epc_email(cols: list[str]) -> str | None:
             norm_map = {c.strip().lower(): c for c in cols}
-            # Prefer explicit work email fields when available
             for pref in ['your work email address', 'work email', 'work e-mail']:
                 if pref in norm_map:
                     return norm_map[pref]
-            # Fallbacks: common exacts, then any column containing 'email'
             norm = [c.strip().lower() for c in cols]
             for i, c in enumerate(norm):
                 if c in {'email', 'email address', 'work email', 'work e-mail'}:
@@ -144,67 +185,119 @@ class CheckInExcelCleaner:
 
         email_col = find_epc_email(list(epc.columns))
         if not email_col:
-            raise ValueError("Manager check-in must contain an email column (e.g., 'Email' or 'Email Address')")
+            raise ValueError("Manager check-in must contain an email column")
 
         epc['__email__'] = self._norm_email(epc[email_col])
 
-        # Avoid collisions: bring in Mena name under a unique temporary column
-        mena_small = mena[['Email', 'EmailKey', 'Employee Name']].rename(columns={'Employee Name': '__Mena_Employee_Name__'})
-        # First pass: exact email match
-        epc = epc.merge(mena_small[['Email', 'EmailKey', '__Mena_Employee_Name__']], left_on='__email__', right_on='Email', how='left')
+        # ---- Step 1: Fix Subordinate Name ----
+        sub_col = next(
+            (c for c in epc.columns if c.strip().lower() == 'subordinate name'),
+            None,
+        ) or 'Subordinate Name'
+        if sub_col not in epc.columns:
+            epc[sub_col] = None
+
+        def _norm_name(x) -> str:
+            return ' '.join(str(x or '').strip().lower().split())
+
+        # Build canonical name lookup
+        name_lookup: dict[str, str] = {}  # normalized name → canonical name
+
+        # (a) From Mena directly: Employee Name variants
+        for _, row in mena.iterrows():
+            canon = str(row['Employee Name']).strip()
+            if not canon or canon.lower() in ('nan', 'none', ''):
+                continue
+            key = _norm_name(canon)
+            name_lookup[key] = canon
+            # Also register first + last name shortcut
+            words = key.split()
+            if len(words) >= 2:
+                name_lookup[f"{words[0]} {words[-1]}"] = canon
+
+        # (b) From cleaned employee check-in: Your Name → Mena Name
+        if df_emp_cleaned is not None:
+            yn_col = next(
+                (c for c in df_emp_cleaned.columns
+                 if c.strip().lower() in {'your name', 'name'}),
+                None,
+            )
+            mn_col = 'Mena Name' if 'Mena Name' in df_emp_cleaned.columns else None
+            if yn_col and mn_col:
+                for _, row in df_emp_cleaned.iterrows():
+                    yn = str(row[yn_col]).strip()
+                    mn = str(row[mn_col]).strip()
+                    if mn and mn.lower() not in ('nan', 'none', ''):
+                        name_lookup[_norm_name(yn)] = mn
+
+        def _find_canonical(sub_name):
+            if pd.isna(sub_name):
+                return sub_name
+            key = _norm_name(sub_name)
+            if not key or key in ('nan', 'none', ''):
+                return sub_name
+            # Exact normalized match
+            if key in name_lookup:
+                return name_lookup[key]
+            # Fuzzy: find the lookup entry sharing the most words (≥ 2)
+            sub_words = set(key.split())
+            best, best_score = None, 0
+            for lk, canon in name_lookup.items():
+                common = sub_words & set(lk.split())
+                if len(common) >= 2 and len(common) > best_score:
+                    best, best_score = canon, len(common)
+            return best if best else sub_name
+
+        epc[sub_col] = epc[sub_col].apply(_find_canonical)
+
+        # ---- Step 2: Add Name on Mena (manager's canonical name) ----
+        mena_small = mena[['Email', 'EmailKey', 'Employee Name']].rename(
+            columns={'Employee Name': '__Mena_Employee_Name__'}
+        )
+        epc = epc.merge(
+            mena_small[['Email', 'EmailKey', '__Mena_Employee_Name__']],
+            left_on='__email__', right_on='Email', how='left',
+        )
         epc['Match Source'] = 'Unmatched'
         epc.loc[epc['__Mena_Employee_Name__'].notna(), 'Match Source'] = 'ExactEmail'
 
-        # Fallback: email local-part if exact match missing
+        # Fallback: email local-part
         need_fallback = epc['__Mena_Employee_Name__'].isna()
         if need_fallback.any():
             epc['__email_key__'] = self._email_key(epc['__email__'])
             fb_df = epc[need_fallback].merge(
                 mena_small[['EmailKey', '__Mena_Employee_Name__']].drop_duplicates('EmailKey'),
-                left_on='__email_key__', right_on='EmailKey', how='left', suffixes=('_l', '_r')
+                left_on='__email_key__', right_on='EmailKey',
+                how='left', suffixes=('_l', '_r'),
             )
-            fallback = fb_df['__Mena_Employee_Name___r'] if '__Mena_Employee_Name___r' in fb_df.columns else fb_df['__Mena_Employee_Name__']
+            fallback = (
+                fb_df['__Mena_Employee_Name___r']
+                if '__Mena_Employee_Name___r' in fb_df.columns
+                else fb_df['__Mena_Employee_Name__']
+            )
             epc.loc[need_fallback, '__Mena_Employee_Name__'] = fallback.values
             newly = need_fallback & epc['__Mena_Employee_Name__'].notna()
             epc.loc[newly, 'Match Source'] = 'LocalPart'
 
         epc['Name on Mena'] = epc['__Mena_Employee_Name__']
 
-        sub_col = next((c for c in epc.columns if c.strip().lower() in {'subordinate name', 'employee name'}), None) or 'Subordinate Name'
-        if sub_col not in epc.columns:
-            epc[sub_col] = None
-        if 'Manager Name' in mena.columns:
-            def norm_name(x: str) -> str:
-                return ' '.join(str(x or '').strip().lower().split())
-            mena_lookup = {}
-            for mgr, grp in mena.groupby('Manager Name'):
-                canon = list(grp['Employee Name'].dropna().astype(str))
-                mena_lookup[norm_name(mgr)] = {norm_name(n): n for n in canon}
-
-            nm_col = 'Name on Mena'
-            if nm_col in epc.columns:
-                def fix_row(row):
-                    mgr_key = norm_name(row.get(nm_col))
-                    sub_val = row.get(sub_col)
-                    if not sub_val or mgr_key not in mena_lookup:
-                        return row
-                    sub_key = norm_name(sub_val)
-                    canon_map = mena_lookup[mgr_key]
-                    if sub_key in canon_map:
-                        row[sub_col] = canon_map[sub_key]
-                    return row
-                epc = epc.apply(fix_row, axis=1)
-
-        cleaned = epc.drop(columns=[c for c in ['__email__', 'Email', 'EmailKey', '__email_key__', '__Mena_Employee_Name__'] if c in epc.columns])
+        # Drop temp columns
+        cleaned = epc.drop(
+            columns=[c for c in [
+                '__email__', 'Email', 'EmailKey',
+                '__email_key__', '__Mena_Employee_Name__',
+            ] if c in epc.columns]
+        )
         return cleaned
 
     def clean_from_paths(self, paths: dict[str, str]) -> dict[str, pd.DataFrame]:
         pc = pd.read_excel(paths['pc'])
         epc = pd.read_excel(paths['epc'])
         mena = pd.read_excel(paths['mena'])
+        emp_cleaned = self.clean_employee_checkin(pc, mena)
         return {
-            'pc_clean': self.clean_employee_checkin(pc, mena),
-            'epc_clean': self.clean_manager_checkin(epc, mena),
+            'pc_clean': emp_cleaned,
+            'epc_clean': self.clean_manager_checkin(epc, mena, df_emp_cleaned=emp_cleaned),
         }
 
     def save_to_paths(self, cleaned: dict[str, pd.DataFrame], out_pc: str, out_epc: str) -> None:
