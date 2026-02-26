@@ -205,9 +205,7 @@ def _load_df(file) -> pd.DataFrame:
 
 
 def _run_comparison() -> None:
-    """Run the YoY comparison pipeline and store results in session state.
-    Called by the KPI Run button so both sections update together.
-    """
+    """Run the YoY comparison pipeline and store results in session state."""
     st.session_state.yoy_ready = False
     st.session_state.yoy_payload = None
 
@@ -217,24 +215,26 @@ def _run_comparison() -> None:
     use_mgr_y2 = st.session_state.get("compare_mgr_y2")
 
     if not (use_emp_y1 and use_mgr_y1 and use_emp_y2 and use_mgr_y2):
+        st.warning("Please upload all 4 check-in files before running the comparison.")
         return
 
-    df_mena = _load_static_mena()
-    if df_mena.empty:
+    # Mena: prefer uploaded, fallback to auto-detected
+    compare_mena = st.session_state.get("compare_mena_upload")
+    if compare_mena:
+        df_mena = _load_df(compare_mena)
+    else:
+        df_mena = _load_static_mena()
+    if df_mena is None or df_mena.empty:
+        st.warning("Please upload a Mena Report for the comparison.")
         return
 
     try:
         cleaner = CheckInExcelCleaner()
 
-        def _load_file(file_or_path):
-            if isinstance(file_or_path, Path):
-                return pd.read_excel(file_or_path) if file_or_path.suffix in ['.xlsx', '.xls'] else pd.read_csv(file_or_path)
-            return _load_df(file_or_path)
-
-        emp1 = _load_file(use_emp_y1)
-        mgr1 = _load_file(use_mgr_y1)
-        emp2 = _load_file(use_emp_y2)
-        mgr2 = _load_file(use_mgr_y2)
+        emp1 = _load_df(use_emp_y1)
+        mgr1 = _load_df(use_mgr_y1)
+        emp2 = _load_df(use_emp_y2)
+        mgr2 = _load_df(use_mgr_y2)
 
         # Detect years from timestamp columns
         emp1_w_year = _add_year_from_timestamp(emp1)
@@ -251,28 +251,9 @@ def _run_comparison() -> None:
         emp2_c = cleaner.clean_employee_checkin(emp2, df_mena)
         mgr2_c = cleaner.clean_manager_checkin(mgr2, df_mena, df_emp_cleaned=emp2_c)
 
-        m1 = _metrics(emp1_c, mgr1_c)
-        m2 = _metrics(emp2_c, mgr2_c)
-
-        kpi = KPIService()
-        risk_h1 = kpi.detect_manager_risk_header(mgr1_c)
-        risk_h2 = kpi.detect_manager_risk_header(mgr2_c)
-
-        def _at_risk_rows(mgr_df, risk_col):
-            if mgr_df is None or mgr_df.empty or not risk_col or risk_col not in mgr_df.columns:
-                return pd.DataFrame()
-            s = mgr_df[risk_col].astype(str).str.strip().str.lower()
-            mask = s.str.startswith(("yes", "y", "true", "1"))
-            return mgr_df[mask].copy()
-
-        risk_df_y1 = _at_risk_rows(mgr1_c, risk_h1)
-        risk_df_y2 = _at_risk_rows(mgr2_c, risk_h2)
-
         st.session_state.yoy_ready = True
         st.session_state.yoy_payload = {
             "y1": y1, "y2": y2,
-            "m1": m1, "m2": m2,
-            "risk_y1": risk_df_y1, "risk_y2": risk_df_y2,
             "emp1_c": emp1_c, "mgr1_c": mgr1_c,
             "emp2_c": emp2_c, "mgr2_c": mgr2_c,
         }
@@ -289,96 +270,59 @@ if section == "KPIs":
         
     divider()
 
-    with st.expander("Upload & Filters", expanded=not st.session_state.clean_ready):
+    with st.expander("Upload", expanded=not st.session_state.clean_ready):
+
+        # --- Mena Report uploader ---
+        mena_upload = st.file_uploader(
+            "Mena Report",
+            type=["xlsx", "xls", "csv"],
+            key="mena_upload",
+        )
 
         col_left, col_right = st.columns(2)
         with col_left:
             emp_file = st.file_uploader(
-                "Employee Check-In File (.xlsx/.xls/.csv)",
+                "Employee Check-In",
                 type=["xlsx", "xls", "csv"],
                 key="emp",
             )
         with col_right:
             mgr_file = st.file_uploader(
-                "Manager Check-In File (.xlsx/.xls/.csv)",
+                "Manager Check-In",
                 type=["xlsx", "xls", "csv"],
                 key="mgr",
             )
 
-        mena_df_preview = _load_static_mena()
-        if mena_df_preview.empty:
-            st.warning("No Mena Report file detected in Data/ or root. Place one before cleaning.")
+        # Resolve Mena: uploaded file takes priority, else auto-detect from Data/
+        if mena_upload:
+            mena_df_preview = _load_df(mena_upload)
+        else:
+            mena_df_preview = _load_static_mena()
 
-        # Filters (always visible). Populate immediately from available sources.
-        year_options = ["All years"]
+        if mena_df_preview.empty:
+            st.warning("No Mena Report provided. Upload one above or place it in the Data/ folder.")
+
+        # Department filter — populate from uploaded files or cleaned data
         dept_choices = ["All departments"]
-        default_year = st.session_state.get("kpi_year_filter")
 
         if emp_file and mgr_file:
             try:
                 emp_raw = _load_df(emp_file)
                 mgr_raw = _load_df(mgr_file)
-                
-                # Extract years
-                emp_with_year = _add_year_from_timestamp(emp_raw)
-                mgr_with_year = _add_year_from_timestamp(mgr_raw)
-                
-                emp_years = sorted([int(y) for y in emp_with_year["Year"].dropna().unique()]) if "Year" in emp_with_year.columns else []
-                mgr_years = sorted([int(y) for y in mgr_with_year["Year"].dropna().unique()]) if "Year" in mgr_with_year.columns else []
-                detected_years = sorted(set(emp_years) | set(mgr_years))
-                if detected_years:
-                    year_options = ["All years"] + detected_years
-                
-                # Extract departments
                 dept_choices = _dept_options(emp_raw, mgr_raw)
             except Exception:
-                pass  # Keep defaults if loading fails
-        
+                pass
+
         # Override with cleaned data if available
         if st.session_state.clean_ready and st.session_state.cleaned_emp is not None and st.session_state.cleaned_mgr is not None:
-            emp_for_filters = st.session_state.cleaned_emp.copy()
-            mgr_for_filters = st.session_state.cleaned_mgr.copy()
-            
-            if "Year" not in emp_for_filters.columns:
-                emp_for_filters = _add_year_from_timestamp(emp_for_filters)
-            if "Year" not in mgr_for_filters.columns:
-                mgr_for_filters = _add_year_from_timestamp(mgr_for_filters)
+            dept_choices = _dept_options(st.session_state.cleaned_emp, st.session_state.cleaned_mgr)
 
-            emp_years = sorted([int(y) for y in emp_for_filters["Year"].dropna().unique()]) if "Year" in emp_for_filters.columns else []
-            mgr_years = sorted([int(y) for y in mgr_for_filters["Year"].dropna().unique()]) if "Year" in mgr_for_filters.columns else []
-            detected_years = sorted(set(emp_years) | set(mgr_years))
-            if detected_years:
-                year_options = ["All years"] + detected_years
-
-            dept_choices = _dept_options(emp_for_filters, mgr_for_filters)
-
-        # Resolve indices for selects
-        if default_year in year_options:
-            year_index = year_options.index(default_year)
-        else:
-            year_index = 0
-
-        c_year, c_dept = st.columns(2)
-        with c_year:
-            st.selectbox(
-                "Filter by year",
-                options=year_options,
-                index=year_index,
-                key="kpi_year_filter",
-            )
-        with c_dept:
-            st.selectbox(
-                "Filter by department",
-                options=dept_choices,
-                index=0,
-                key="kpi_dept_filter",
-            )
-
-        # Show status after cleaning
-        if st.session_state.clean_ready and st.session_state.cleaned_emp is not None and st.session_state.cleaned_mgr is not None:
-            emp_dept_col = "Company Name / Department" if "Company Name / Department" in st.session_state.cleaned_emp.columns else _find_dept_col(st.session_state.cleaned_emp)
-            mgr_dept_col = "Company Name/Department" if "Company Name/Department" in st.session_state.cleaned_mgr.columns else _find_dept_col(st.session_state.cleaned_mgr)
-            st.caption(f"📊 Filters active: {len(year_options)-1} year(s), {len(dept_choices)-1} department(s) | Emp dept col: {emp_dept_col or 'Not found'}, Mgr dept col: {mgr_dept_col or 'Not found'}")
+        st.selectbox(
+            "Filter by department",
+            options=dept_choices,
+            index=0,
+            key="kpi_dept_filter",
+        )
 
         
     run_btn = st.button("Run", type="primary", use_container_width=True)
@@ -397,9 +341,13 @@ if section == "KPIs":
         if not (emp_file and mgr_file):
             st.session_state.clean_error = "Upload both Employee and Manager check-in files."
         else:
-            df_mena = _load_static_mena()
-            if df_mena.empty:
-                st.session_state.clean_error = "Static Mena Report file not found. Place 'Mena Report.xlsx' in Data/ or root."
+            # Resolve Mena: uploaded takes priority, else auto-detect
+            if mena_upload:
+                df_mena = _load_df(mena_upload)
+            else:
+                df_mena = _load_static_mena()
+            if df_mena is None or df_mena.empty:
+                st.session_state.clean_error = "No Mena Report found. Upload one in the Upload section."
             else:
                 df_emp = _load_df(emp_file)
                 df_mgr = _load_df(mgr_file)
@@ -417,10 +365,6 @@ if section == "KPIs":
                     st.session_state.combined = combined
                     st.session_state.clean_ready = True
 
-        # Also run YoY comparison so the Compare tab is ready
-        if st.session_state.clean_ready:
-            _run_comparison()
-
     # -------------------------
     # Feedback after clicking Run Cleaning
     # -------------------------
@@ -430,32 +374,18 @@ if section == "KPIs":
     if st.session_state.clean_ready and st.session_state.cleaned_emp is not None and st.session_state.cleaned_mgr is not None:
         st.caption(f"Employee rows: {len(st.session_state.cleaned_emp)} | Manager rows: {len(st.session_state.cleaned_mgr)}")
 
-        cleaned_emp = _add_year_from_timestamp(st.session_state.cleaned_emp)
-        cleaned_mgr = _add_year_from_timestamp(st.session_state.cleaned_mgr)
+        cleaned_emp = st.session_state.cleaned_emp
+        cleaned_mgr = st.session_state.cleaned_mgr
 
-        # Persist updated data with Year column
-        st.session_state.cleaned_emp = cleaned_emp
-        st.session_state.cleaned_mgr = cleaned_mgr
-
-        # Pull selected filters (set in Data Source & Filters expander)
-        selected_year = st.session_state.get("kpi_year_filter", "All years")
+        # Pull selected department filter
         selected_dept = st.session_state.get("kpi_dept_filter", "All departments")
 
-        # Apply Year filter first
-        def _filter_by_year(df: pd.DataFrame, year_sel):
-            if df is None or df.empty or year_sel == "All years" or "Year" not in df.columns:
-                return df
-            return df[df["Year"] == year_sel].copy()
+        # Apply Department filter
+        emp_dept_col = "Company Name / Department" if "Company Name / Department" in cleaned_emp.columns else _find_dept_col(cleaned_emp)
+        mgr_dept_col = "Company Name/Department" if "Company Name/Department" in cleaned_mgr.columns else _find_dept_col(cleaned_mgr)
 
-        emp_tmp = _filter_by_year(cleaned_emp, selected_year)
-        mgr_tmp = _filter_by_year(cleaned_mgr, selected_year)
-
-        # Then apply Department filter
-        emp_dept_col = "Company Name / Department" if "Company Name / Department" in emp_tmp.columns else _find_dept_col(emp_tmp)
-        mgr_dept_col = "Company Name/Department" if "Company Name/Department" in mgr_tmp.columns else _find_dept_col(mgr_tmp)
-
-        emp_f = _filter_by_dept(emp_tmp, emp_dept_col, selected_dept)
-        mgr_f = _filter_by_dept(mgr_tmp, mgr_dept_col, selected_dept)
+        emp_f = _filter_by_dept(cleaned_emp, emp_dept_col, selected_dept)
+        mgr_f = _filter_by_dept(cleaned_mgr, mgr_dept_col, selected_dept)
 
         # --- KPIs on filtered data ---
         m = _metrics(emp_f, mgr_f)
@@ -1998,6 +1928,13 @@ elif section == "Compare":
 
     with st.expander("Upload", expanded=not st.session_state.yoy_ready):
 
+        # Mena Report uploader for comparison
+        st.file_uploader(
+            "Mena Report",
+            type=["xlsx", "xls", "csv"],
+            key="compare_mena_upload",
+        )
+
         col1, col2 = st.columns(2)
 
         with col1:
@@ -2026,22 +1963,80 @@ elif section == "Compare":
                 key="compare_mgr_y2",
             )
 
+        # Department filter for comparison
+        compare_dept_choices = ["All departments"]
+        if st.session_state.get("compare_emp_y1") and st.session_state.get("compare_mgr_y1"):
+            try:
+                _tmp_emp = _load_df(st.session_state["compare_emp_y1"])
+                _tmp_mgr = _load_df(st.session_state["compare_mgr_y1"])
+                compare_dept_choices = _dept_options(_tmp_emp, _tmp_mgr)
+            except Exception:
+                pass
+        if st.session_state.yoy_ready and st.session_state.yoy_payload:
+            try:
+                _p = st.session_state.yoy_payload
+                compare_dept_choices = _dept_options(_p.get("emp1_c", pd.DataFrame()), _p.get("mgr1_c", pd.DataFrame()))
+            except Exception:
+                pass
+
+        st.selectbox(
+            "Filter by department",
+            options=compare_dept_choices,
+            index=0,
+            key="compare_dept_filter",
+        )
+
+    compare_run_btn = st.button("Run Comparison", type="primary", use_container_width=True, key="compare_run_btn")
+
+    if compare_run_btn:
+        st.session_state.yoy_ready = False
+        st.session_state.yoy_payload = None
+        _run_comparison()
+
     if not st.session_state.yoy_ready:
-        st.info("💡 Go to the **KPIs** section and click **Run** to load both KPIs and the year-over-year comparison.")
+        st.info("Upload the 4 check-in files above and click **Run Comparison**.")
 
     if st.session_state.yoy_ready and st.session_state.yoy_payload:
         y1 = st.session_state.yoy_payload["y1"]
         y2 = st.session_state.yoy_payload["y2"]
-        m1 = st.session_state.yoy_payload["m1"]
-        m2 = st.session_state.yoy_payload["m2"]
-        risk_df_y1 = st.session_state.yoy_payload["risk_y1"]
-        risk_df_y2 = st.session_state.yoy_payload["risk_y2"]
-        
+
         # Store cleaned data for detailed comparisons
         emp1_c = st.session_state.yoy_payload.get("emp1_c")
         mgr1_c = st.session_state.yoy_payload.get("mgr1_c")
         emp2_c = st.session_state.yoy_payload.get("emp2_c")
         mgr2_c = st.session_state.yoy_payload.get("mgr2_c")
+
+        # Apply department filter to comparison data
+        compare_selected_dept = st.session_state.get("compare_dept_filter", "All departments")
+
+        def _apply_dept_filter(df):
+            if df is None or df.empty:
+                return df
+            dc = "Company Name / Department" if "Company Name / Department" in df.columns else _find_dept_col(df)
+            return _filter_by_dept(df, dc, compare_selected_dept)
+
+        emp1_c = _apply_dept_filter(emp1_c)
+        mgr1_c = _apply_dept_filter(mgr1_c)
+        emp2_c = _apply_dept_filter(emp2_c)
+        mgr2_c = _apply_dept_filter(mgr2_c)
+
+        # Recalculate metrics on filtered data
+        m1 = _metrics(emp1_c, mgr1_c)
+        m2 = _metrics(emp2_c, mgr2_c)
+
+        kpi = KPIService()
+        risk_h1 = kpi.detect_manager_risk_header(mgr1_c)
+        risk_h2 = kpi.detect_manager_risk_header(mgr2_c)
+
+        def _at_risk_rows_cmp(mgr_df, risk_col):
+            if mgr_df is None or mgr_df.empty or not risk_col or risk_col not in mgr_df.columns:
+                return pd.DataFrame()
+            s = mgr_df[risk_col].astype(str).str.strip().str.lower()
+            mask = s.str.startswith(("yes", "y", "true", "1"))
+            return mgr_df[mask].copy()
+
+        risk_df_y1 = _at_risk_rows_cmp(mgr1_c, risk_h1)
+        risk_df_y2 = _at_risk_rows_cmp(mgr2_c, risk_h2)
 
         # High-level summary cards
         divider()
