@@ -2,6 +2,5 @@ pandas
 openpyxl
 streamlit
 numpy
-vaderSentiment
 matplotlib
 xlrd>=2.0.1

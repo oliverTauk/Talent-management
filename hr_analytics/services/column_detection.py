@@ -67,6 +67,20 @@ _find_aligned_goals_col = _make_col_finder(
     ["aligned", "goals"],
 )
 
+_find_discussed_professional_goals_col = _make_col_finder(
+    ["discussed", "professional", "goals"],
+    ["discuss", "professional", "goals"],
+    ["professional", "goals", "year"],
+)
+
+_find_responsibility_growth_col = _make_col_finder(
+    ["tasks", "responsibilities", "aligned", "professional", "growth"],
+    ["tasks", "responsibilities", "aligned", "growth"],
+    ["tasks", "aligned", "professional", "growth"],
+    ["responsibilities", "aligned", "growth"],
+    ["tasks", "aligned", "growth"],
+)
+
 _find_if_no_elaborate_col = _make_col_finder(
     ["if", "no", "elaborate"],
     ["if", "answered", "no"],
@@ -169,7 +183,7 @@ def _find_ready_for_promotion_col(df: pd.DataFrame) -> str | None:
 def _find_employee_name_col(df: pd.DataFrame) -> str | None:
     # common possibilities in cleaned files
     for cand in ["Employee Name", "employee_name", "Name", "Full Name", "Employee"]:
-        if cand in df.columns:
+        if cand in df.columns and df[cand].notna().any():
             return cand
     # fallback: try keyword match
     for c in df.columns:
@@ -183,7 +197,7 @@ def _find_your_name_col(df: pd.DataFrame) -> str | None:
     """Detect the respondent-name column in an *employee* check-in."""
     prefs = ["Mena Name", "Your Name", "Employee Name"]
     for p in prefs:
-        if p in df.columns:
+        if p in df.columns and df[p].notna().any():
             return p
     for c in df.columns:
         h = _norm(c)
@@ -196,7 +210,7 @@ def _find_subordinate_name_col(df: pd.DataFrame) -> str | None:
     # Prefer exact cleaned canonical field
     if df is None or df.empty:
         return None
-    if "Subordinate Name" in df.columns:
+    if "Subordinate Name" in df.columns and df["Subordinate Name"].notna().any():
         return "Subordinate Name"
     # Fallback: keyword-based detection
     col = _find_col_by_keywords(df, ["subordinate", "name"])  # token match
@@ -262,13 +276,21 @@ def _find_pip_reason_no_col(df: pd.DataFrame) -> str | None:
 
 # -- Check-in frequency --
 def _find_checkin_freq_col_emp(df: pd.DataFrame) -> str | None:
-    return _find_col_by_keywords(df, ["had", "check", "in", "meeting", "with", "my", "manager"]) or \
-           _find_col_by_keywords(df, ["check", "in", "meeting", "my", "manager"])
+    return (
+        _find_col_by_keywords(df, ["had", "check", "in", "with", "my", "manager"]) or
+        _find_col_by_keywords(df, ["check", "in", "manager", "follow"]) or
+        _find_col_by_keywords(df, ["check", "in", "meeting", "my", "manager"]) or
+        _find_col_by_keywords(df, ["check", "in", "my", "manager"])
+    )
 
 
 def _find_checkin_freq_col_mgr(df: pd.DataFrame) -> str | None:
-    return _find_col_by_keywords(df, ["had", "check", "in", "meeting", "with", "this", "person"]) or \
-           _find_col_by_keywords(df, ["check", "in", "meeting", "this", "person"])
+    return (
+        _find_col_by_keywords(df, ["had", "call", "meeting", "this", "person"]) or
+        _find_col_by_keywords(df, ["had", "check", "follow", "this", "person"]) or
+        _find_col_by_keywords(df, ["check", "in", "meeting", "this", "person"]) or
+        _find_col_by_keywords(df, ["call", "meeting", "check", "follow"])
+    )
 
 
 # -- Resources --

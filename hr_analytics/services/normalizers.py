@@ -484,12 +484,12 @@ FREQ_CATS = ["Weekly", "Monthly", "Few", "Zero"]
 
 def _norm_freq(x: str) -> str:
     s = _norm(x)
+    if "few" in s:
+        return "Few"
     if "week" in s:
         return "Weekly"
     if "month" in s:
         return "Monthly"
-    if "few" in s:
-        return "Few"
     if "zero" in s or s == "0":
         return "Zero"
     return "Unknown"

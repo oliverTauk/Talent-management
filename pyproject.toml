@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "hr-analytics"
+version = "0.1.0"
+description = "HR Analytics – check-in cleaning, KPIs, and year-over-year comparison"
+requires-python = ">=3.9"
+
+[tool.setuptools.packages.find]
+include = ["hr_analytics*"]
