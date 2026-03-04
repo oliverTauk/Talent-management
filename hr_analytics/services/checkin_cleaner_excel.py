@@ -56,7 +56,9 @@ class CheckInExcelCleaner:
         )
 
         if not (email_c and emp_name_c):
-            raise ValueError("Mena Report must contain an email column and an 'Employee Name' column")
+            raise ValueError(
+                f"Mena Report must contain an email column and an 'Employee Name' column."
+            )
 
         rename_map = {email_c: 'Email', emp_name_c: 'Employee Name'}
         if mgr_name_c and mgr_name_c != 'Manager Name':
@@ -150,6 +152,41 @@ class CheckInExcelCleaner:
         # Coalesce: fall back to original name when Mena Name is NaN (unmatched)
         mapped['Mena Name'] = mapped['Mena Name'].fillna(mapped[name_col])
         out = mapped.drop(columns=[c for c in ['__email__', 'Email', 'EmailKey', '__email_key__', '__Mena_Employee_Name__'] if c in mapped.columns])
+
+        # ── Canonicalize manager name ────────────────────────
+        # Join back to Mena: employee's Mena Name → Mena Employee Name
+        # to get the canonical Manager Name from the Mena report.
+        mgr_col_in_checkin = next(
+            (c for c in out.columns if c.strip().lower() in {
+                "your manager's name", "your managers name",
+                "manager name", "manager's name",
+            }),
+            None,
+        )
+        if mgr_col_in_checkin and 'Manager Name' in mena.columns:
+            mena_mgr = (
+                mena[['Employee Name', 'Manager Name']]
+                .drop_duplicates('Employee Name')
+                .rename(columns={'Manager Name': '__Mena_Manager_Name__'})
+            )
+            out = out.merge(
+                mena_mgr,
+                left_on='Mena Name',
+                right_on='Employee Name',
+                how='left',
+                suffixes=('', '__mgr_dup__'),
+            )
+            # Replace the self-reported manager name with the canonical one
+            has_canonical = out['__Mena_Manager_Name__'].notna()
+            out.loc[has_canonical, mgr_col_in_checkin] = out.loc[has_canonical, '__Mena_Manager_Name__']
+            # Drop temp columns
+            out = out.drop(
+                columns=[c for c in out.columns if c.startswith('__Mena_Manager_') or c.endswith('__mgr_dup__')],
+            )
+            # Also drop the duplicate 'Employee Name' if it appeared from the merge
+            if 'Employee Name' in out.columns and 'Mena Name' in out.columns:
+                out = out.drop(columns=['Employee Name'], errors='ignore')
+
         return out
 
     def clean_manager_checkin(

@@ -47,8 +47,13 @@ def _make_col_finder(*keyword_groups: list[str]) -> Callable[[pd.DataFrame], str
 
 
 def _find_col_by_keywords(df: pd.DataFrame, keywords_all: list[str]) -> str | None:
-    """Return first column whose header contains ALL keywords."""
-    if df is None or df.empty:
+    """Return first column whose header contains ALL keywords.
+
+    Accepts DataFrames with zero rows (e.g. just column headers) because
+    ``pd.DataFrame.empty`` is True for any 0-row frame, which would
+    otherwise cause premature short-circuit.
+    """
+    if df is None or len(df.columns) == 0:
         return None
     keys = [_norm(k) for k in keywords_all]
     for c in df.columns:
@@ -208,9 +213,9 @@ def _find_your_name_col(df: pd.DataFrame) -> str | None:
 
 def _find_subordinate_name_col(df: pd.DataFrame) -> str | None:
     # Prefer exact cleaned canonical field
-    if df is None or df.empty:
+    if df is None or len(df.columns) == 0:
         return None
-    if "Subordinate Name" in df.columns and df["Subordinate Name"].notna().any():
+    if "Subordinate Name" in df.columns:
         return "Subordinate Name"
     # Fallback: keyword-based detection
     col = _find_col_by_keywords(df, ["subordinate", "name"])  # token match

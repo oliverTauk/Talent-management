@@ -117,6 +117,13 @@ section = st.sidebar.radio(
     index=0
 )
 
+# NLP subsection toggle (visible only when KPIs is selected)
+_show_nlp = False
+if section == "KPIs":
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Subsections")
+    _show_nlp = st.sidebar.checkbox("NLP", value=False, key="show_nlp_subsection")
+
 # ============================================================
 # Session state init
 # ============================================================
@@ -134,6 +141,14 @@ if "yoy_ready" not in st.session_state:
     st.session_state.yoy_ready = False
     st.session_state.yoy_payload = None
 
+# NLP session state
+if "nlp_results" not in st.session_state:
+    st.session_state.nlp_results = None
+if "nlp_error" not in st.session_state:
+    st.session_state.nlp_error = None
+if "nlp_cache" not in st.session_state:
+    st.session_state.nlp_cache = {}  # persistent cache across re-runs
+
 
 # Back button (always visible)
 if st.button("⬅ Back to Home"):
@@ -150,21 +165,29 @@ def _load_static_mena() -> pd.DataFrame:
     exts = {".xlsx", ".xls", ".csv"}
 
     def _read_any(p: Path) -> pd.DataFrame:
-        if p.suffix.lower() == ".csv":
-            return pd.read_csv(str(p))
-        else:
+        try:
+            if p.suffix.lower() == ".csv":
+                return pd.read_csv(str(p))
+            if p.suffix.lower() == ".xls":
+                return pd.read_excel(str(p), engine="xlrd")
             return pd.read_excel(str(p), engine="openpyxl")
+        except Exception:
+            return pd.DataFrame()
 
 
 
     # ✅ Force this exact file name (check Data/ and subdirectories)
     forced = base / "Data" / "Mena Report - Copy Tech.xlsx"
     if forced.exists():
-        return _read_any(forced)
+        result = _read_any(forced)
+        if not result.empty:
+            return result
     # Also check subdirectories
     forced_sub = base / "Data" / "Check-ins 2024 2025" / "Mena Report - Copy Tech.xlsx"
     if forced_sub.exists():
-        return _read_any(forced_sub)
+        result = _read_any(forced_sub)
+        if not result.empty:
+            return result
 
     mena_files = []
     data_dir = base / "Data"
@@ -185,58 +208,286 @@ def _load_static_mena() -> pd.DataFrame:
                 mena_files.append(p)
 
     if mena_files:
-        p = max(mena_files, key=lambda q: q.stat().st_mtime)
-        return _read_any(p)
+        # Try files in order of most recently modified
+        for p in sorted(mena_files, key=lambda q: q.stat().st_mtime, reverse=True):
+            result = _read_any(p)
+            if not result.empty:
+                return result
 
     return pd.DataFrame()
 
 @st.cache_data(show_spinner=True)
 def _load_df(file) -> pd.DataFrame:
+    """Read an uploaded file into a DataFrame.
+
+    Returns an empty DataFrame on any read error (corruption, wrong format,
+    password-protected, etc.) so the validation layer can report it cleanly.
+    """
     if file is None:
         return pd.DataFrame()
     name = file.name.lower()
     data = file.read()
     file.seek(0)
     bio = io.BytesIO(data)
-    if name.endswith(".csv"):
-        return pd.read_csv(bio)
-    return pd.read_excel(bio)
+    try:
+        if name.endswith(".csv"):
+            return pd.read_csv(bio)
+        if name.endswith(".xls") and not name.endswith(".xlsx"):
+            return pd.read_excel(bio, engine="xlrd")
+        return pd.read_excel(bio, engine="openpyxl")
+    except Exception as exc:
+        # Store the read error so upstream callers can surface it
+        st.session_state["_last_load_error"] = f"{file.name}: {exc}"
+        return pd.DataFrame()
 
+
+# ============================================================
+# File-upload validation helpers
+# ============================================================
+import re as _re
+
+
+def _extract_year_from_filename(filename: str) -> int | None:
+    """Return the first 4-digit year (2000–2099) found in *filename*, or None."""
+    m = _re.search(r"(20\d{2})", filename)
+    return int(m.group(1)) if m else None
+
+
+def _extract_year_from_data(df: pd.DataFrame) -> int | None:
+    """Return the most common year found in the Timestamp column of *df*, or None."""
+    if df is None or df.empty:
+        return None
+    # Find a timestamp-like column
+    ts_col = None
+    candidates = ["Timestamp", "timestamp", "Submission Timestamp", "Submitted at", "Date", "date"]
+    for c in candidates:
+        if c in df.columns:
+            ts_col = c
+            break
+    if ts_col is None:
+        for c in df.columns:
+            if "timestamp" in str(c).lower():
+                ts_col = c
+                break
+    if ts_col is None:
+        return None
+    ts = pd.to_datetime(df[ts_col], errors="coerce", infer_datetime_format=True)
+    years = ts.dt.year.dropna()
+    if years.empty:
+        return None
+    return int(years.mode().iloc[0])
+
+
+def _has_col(df: pd.DataFrame, target: str) -> bool:
+    """Case-insensitive column existence check."""
+    target_low = target.lower()
+    return any(c.lower().strip() == target_low for c in df.columns)
+
+
+def _has_col_containing(df: pd.DataFrame, token: str) -> bool:
+    """Return True if any column header contains *token* (case-insensitive)."""
+    token_low = token.lower()
+    return any(token_low in c.lower() for c in df.columns)
+
+
+def _is_employee_checkin(df: pd.DataFrame) -> bool:
+    """Detect employee check-in: has a column 'Your Manager's Name'."""
+    if df is None or df.empty:
+        return False
+    return _has_col(df, "Your Manager's Name")
+
+
+def _is_manager_checkin(df: pd.DataFrame) -> bool:
+    """Detect manager check-in: has a 'Subordinate Name' column."""
+    if df is None or df.empty:
+        return False
+    return _has_col(df, "Subordinate Name")
+
+
+def _validate_employee_checkin(file, df: pd.DataFrame) -> str | None:
+    """Return an error message or None if the file looks like an employee check-in."""
+    name = file.name if hasattr(file, "name") else str(file)
+    # 0. File must have loaded successfully
+    if df is None or df.empty:
+        return f"File '{name}' could not be read — it may be corrupted, password-protected, or in an unsupported format."
+    # 1. Must look like an employee check-in based on columns
+    if not _is_employee_checkin(df):
+        return (
+            f"Employee Check-In file must contain a column named \"Your Manager's Name\"."
+        )
+    # 2. Year must be extractable from Timestamp column
+    year = _extract_year_from_data(df)
+    if year is None:
+        return f"Could not extract a year from the Timestamp column in '{name}'. Ensure the file has a Timestamp column with valid dates."
+    return None
+
+
+def _validate_manager_checkin(file, df: pd.DataFrame) -> str | None:
+    """Return an error message or None if the file looks like a manager check-in."""
+    name = file.name if hasattr(file, "name") else str(file)
+    # 0. File must have loaded successfully
+    if df is None or df.empty:
+        return f"File '{name}' could not be read — it may be corrupted, password-protected, or in an unsupported format."
+    # 1. Must look like a manager check-in based on columns:
+    #    has 'Subordinate Name' and no column containing 'manager'
+    if not _is_manager_checkin(df):
+        return (
+            f"Manager Check-In file must contain a column named \"Subordinate Name\"."
+        )
+    # 2. Year must be extractable from Timestamp column
+    year = _extract_year_from_data(df)
+    if year is None:
+        return f"Could not extract a year from the Timestamp column in '{name}'. Ensure the file has a Timestamp column with valid dates."
+    return None
+
+
+def _validate_mena_report(file_or_label, df: pd.DataFrame) -> str | None:
+    """Return an error message or None if the DataFrame looks like a Mena Report."""
+    name = file_or_label.name if hasattr(file_or_label, "name") else str(file_or_label)
+    # 0. File must have loaded successfully
+    if df is None or df.empty:
+        return f"Mena Report ({name}) could not be read — it may be corrupted, password-protected, or in an unsupported format."
+    # Required columns: Employee Name, Email, Manager Name
+    required = ["Employee Name", "Email", "Manager Name"]
+    missing = [r for r in required if not _has_col(df, r)]
+    if missing:
+        return (
+            f"Mena Report ({name}) is missing required columns: {missing}."
+        )
+    return None
+
+
+def _validate_year_consistency(
+    df_emp: pd.DataFrame, df_mgr: pd.DataFrame
+) -> str | None:
+    """Check that years extracted from the Timestamp columns of employee and manager DataFrames match."""
+    emp_year = _extract_year_from_data(df_emp)
+    mgr_year = _extract_year_from_data(df_mgr)
+
+    years: dict[str, int] = {}
+    if emp_year:
+        years["Employee Check-In"] = emp_year
+    if mgr_year:
+        years["Manager Check-In"] = mgr_year
+
+    unique = set(years.values())
+    if len(unique) > 1:
+        detail = ", ".join(f"{k} → {v}" for k, v in years.items())
+        return f"Year mismatch across uploaded files: {detail}. All files must be from the same year."
+    return None
 
 
 def _run_comparison() -> None:
-    """Run the YoY comparison pipeline and store results in session state."""
+    """Run the YoY comparison pipeline and store results in session state.
+
+    Collects *all* validation errors across every uploader so the user can
+    fix everything in one pass instead of playing whack-a-mole.
+    """
     st.session_state.yoy_ready = False
     st.session_state.yoy_payload = None
 
-    use_emp_y1 = st.session_state.get("compare_emp_y1")
-    use_mgr_y1 = st.session_state.get("compare_mgr_y1")
-    use_emp_y2 = st.session_state.get("compare_emp_y2")
-    use_mgr_y2 = st.session_state.get("compare_mgr_y2")
+    # ── 1. Gather uploaded files ──────────────────────────────────────────
+    use_emp_y1  = st.session_state.get("compare_emp_y1")
+    use_mgr_y1  = st.session_state.get("compare_mgr_y1")
+    use_mena_y1 = st.session_state.get("compare_mena_y1")
+    use_emp_y2  = st.session_state.get("compare_emp_y2")
+    use_mgr_y2  = st.session_state.get("compare_mgr_y2")
+    use_mena_y2 = st.session_state.get("compare_mena_y2")
 
-    if not (use_emp_y1 and use_mgr_y1 and use_emp_y2 and use_mgr_y2):
-        st.warning("Please upload all 4 check-in files before running the comparison.")
+    errors: list[tuple[str, str]] = []          # (section_label, message)
+
+    # ── 2. Check for missing uploads ──────────────────────────────────────
+    if not use_emp_y1:
+        errors.append(("Baseline Period", "Employee Check-In file is missing."))
+    if not use_mgr_y1:
+        errors.append(("Baseline Period", "Manager Check-In file is missing."))
+    if not use_mena_y1:
+        errors.append(("Baseline Period", "Mena Report file is missing."))
+    if not use_emp_y2:
+        errors.append(("Comparison Period", "Employee Check-In file is missing."))
+    if not use_mgr_y2:
+        errors.append(("Comparison Period", "Manager Check-In file is missing."))
+    if not use_mena_y2:
+        errors.append(("Comparison Period", "Mena Report file is missing."))
+
+    # If any files are completely missing, show summary and stop early
+    if errors:
+        _show_validation_errors(errors)
         return
 
-    # Mena: prefer uploaded, fallback to auto-detected
-    compare_mena = st.session_state.get("compare_mena_upload")
-    if compare_mena:
-        df_mena = _load_df(compare_mena)
-    else:
-        df_mena = _load_static_mena()
-    if df_mena is None or df_mena.empty:
-        st.warning("Please upload a Mena Report for the comparison.")
+    # ── 3. Load DataFrames ────────────────────────────────────────────────
+    emp1       = _load_df(use_emp_y1)
+    mgr1       = _load_df(use_mgr_y1)
+    df_mena_y1 = _load_df(use_mena_y1)
+    emp2       = _load_df(use_emp_y2)
+    mgr2       = _load_df(use_mgr_y2)
+    df_mena_y2 = _load_df(use_mena_y2)
+
+    # ── 4. File & column validations (collect all, don't stop early) ──────
+    for label, f, df, validator in [
+        ("Baseline Employee Check-In",    use_emp_y1,  emp1, _validate_employee_checkin),
+        ("Baseline Manager Check-In",     use_mgr_y1,  mgr1, _validate_manager_checkin),
+        ("Comparison Employee Check-In",  use_emp_y2,  emp2, _validate_employee_checkin),
+        ("Comparison Manager Check-In",   use_mgr_y2,  mgr2, _validate_manager_checkin),
+    ]:
+        err = validator(f, df)
+        if err:
+            period = "Baseline Period" if "Baseline" in label else "Comparison Period"
+            errors.append((period, f"{label}: {err}"))
+
+    # ── 5. Validate Mena Reports ──────────────────────────────────────────
+    for period, mena_file, mena_df in [
+        ("Baseline Period",    use_mena_y1, df_mena_y1),
+        ("Comparison Period",  use_mena_y2, df_mena_y2),
+    ]:
+        if mena_df is None or mena_df.empty:
+            errors.append((period, f"Mena Report ({mena_file.name}) appears empty or unreadable."))
+        else:
+            err = _validate_mena_report(mena_file, mena_df)
+            if err:
+                errors.append((period, err))
+
+    # ── 6. Year consistency within each period (from Timestamp columns) ──
+    #    Also validate that Mena filename includes a year matching the check-in data year.
+    baseline_year = None
+    comparison_year = None
+    for period, emp_df, mgr_df, mena_file in [
+        ("Baseline Period",    emp1, mgr1, use_mena_y1),
+        ("Comparison Period",  emp2, mgr2, use_mena_y2),
+    ]:
+        # Check employee & manager Timestamp years match
+        err = _validate_year_consistency(emp_df, mgr_df)
+        if err:
+            errors.append((period, err))
+
+        # Determine the data year from check-ins
+        data_year = _extract_year_from_data(emp_df) or _extract_year_from_data(mgr_df)
+
+        # Mena filename must include a year
+        mena_filename_year = _extract_year_from_filename(mena_file.name) if mena_file else None
+        if mena_filename_year is None:
+            errors.append((period, f"Mena Report filename must include a year (e.g. 2025). Got: '{mena_file.name}'."))
+        elif data_year and mena_filename_year != data_year:
+            errors.append((period, f"Mena Report year ({mena_filename_year}) does not match the check-in data year ({data_year})."))
+
+        if period == "Baseline Period":
+            baseline_year = data_year
+        else:
+            comparison_year = data_year
+
+    # ── 6b. Baseline year must be less than comparison year ───────────────
+    if baseline_year and comparison_year and baseline_year >= comparison_year:
+        errors.append(("Year Order", f"Baseline year ({baseline_year}) must be earlier than comparison year ({comparison_year})."))
+
+    # ── 7. Show all collected errors at once ──────────────────────────────
+    if errors:
+        _show_validation_errors(errors)
         return
 
+    # ── 8. Clean & store ──────────────────────────────────────────────────
     try:
         cleaner = CheckInExcelCleaner()
 
-        emp1 = _load_df(use_emp_y1)
-        mgr1 = _load_df(use_mgr_y1)
-        emp2 = _load_df(use_emp_y2)
-        mgr2 = _load_df(use_mgr_y2)
-
-        # Detect years from timestamp columns
         emp1_w_year = _add_year_from_timestamp(emp1)
         emp2_w_year = _add_year_from_timestamp(emp2)
 
@@ -246,10 +497,10 @@ def _run_comparison() -> None:
         y1 = int(y1_emp) if isinstance(y1_emp, (int, float)) else y1_emp
         y2 = int(y2_emp) if isinstance(y2_emp, (int, float)) else y2_emp
 
-        emp1_c = cleaner.clean_employee_checkin(emp1, df_mena)
-        mgr1_c = cleaner.clean_manager_checkin(mgr1, df_mena, df_emp_cleaned=emp1_c)
-        emp2_c = cleaner.clean_employee_checkin(emp2, df_mena)
-        mgr2_c = cleaner.clean_manager_checkin(mgr2, df_mena, df_emp_cleaned=emp2_c)
+        emp1_c = cleaner.clean_employee_checkin(emp1, df_mena_y1)
+        mgr1_c = cleaner.clean_manager_checkin(mgr1, df_mena_y1, df_emp_cleaned=emp1_c)
+        emp2_c = cleaner.clean_employee_checkin(emp2, df_mena_y2)
+        mgr2_c = cleaner.clean_manager_checkin(mgr2, df_mena_y2, df_emp_cleaned=emp2_c)
 
         st.session_state.yoy_ready = True
         st.session_state.yoy_payload = {
@@ -257,8 +508,25 @@ def _run_comparison() -> None:
             "emp1_c": emp1_c, "mgr1_c": mgr1_c,
             "emp2_c": emp2_c, "mgr2_c": mgr2_c,
         }
-    except Exception:
-        pass  # Comparison silently skipped if it fails
+    except Exception as exc:
+        _show_validation_errors([("Processing", f"Cleaning failed: {exc}")])
+
+
+def _show_validation_errors(errors: list[tuple[str, str]]) -> None:
+    """Display all validation errors in a single, professionally grouped block."""
+    from collections import OrderedDict
+    grouped: dict[str, list[str]] = OrderedDict()
+    for section, msg in errors:
+        grouped.setdefault(section, []).append(msg)
+
+    lines = ["**The following issues were found. Please fix them and try again.**\n"]
+    for section, msgs in grouped.items():
+        lines.append(f"**{section}**")
+        for msg in msgs:
+            lines.append(f"- {msg}")
+        lines.append("")  # blank line between sections
+
+    st.error("\n".join(lines))
 
 
 # ============================================================
@@ -334,27 +602,65 @@ if section == "KPIs":
         st.session_state.combined = None
         st.session_state.clean_ready = False
 
-        cleaned_emp = pd.DataFrame()
-        cleaned_mgr = pd.DataFrame()
-        combined = pd.DataFrame()
+        errors: list[tuple[str, str]] = []
 
-        if not (emp_file and mgr_file):
-            st.session_state.clean_error = "Upload both Employee and Manager check-in files."
+        # ── 1. Check for missing uploads ──────────────────────────────
+        if not emp_file:
+            errors.append(("Missing Files", "Employee Check-In file is missing."))
+        if not mgr_file:
+            errors.append(("Missing Files", "Manager Check-In file is missing."))
+
+        # Resolve Mena: uploaded takes priority, else auto-detect
+        df_mena = None
+        _mena_source = None
+        if mena_upload:
+            df_mena = _load_df(mena_upload)
+            _mena_source = mena_upload.name
         else:
-            # Resolve Mena: uploaded takes priority, else auto-detect
-            if mena_upload:
-                df_mena = _load_df(mena_upload)
-            else:
-                df_mena = _load_static_mena()
-            if df_mena is None or df_mena.empty:
-                st.session_state.clean_error = "No Mena Report found. Upload one in the Upload section."
-            else:
-                df_emp = _load_df(emp_file)
-                df_mgr = _load_df(mgr_file)
+            df_mena = _load_static_mena()
+            _mena_source = "auto-detected from Data/ folder"
 
-                if df_emp.empty or df_mgr.empty:
-                    st.session_state.clean_error = "One of the uploaded files appears empty or unreadable."
-                else:
+        if df_mena is None or df_mena.empty:
+            errors.append(("Mena Report", "No Mena Report found. Upload one or place it in the Data/ folder."))
+
+        # If files are completely missing, show summary and stop early
+        if errors:
+            _show_validation_errors(errors)
+        else:
+            df_emp = _load_df(emp_file)
+            df_mgr = _load_df(mgr_file)
+
+            # ── 2. File & column validations (collect all) ────────────
+            err = _validate_employee_checkin(emp_file, df_emp)
+            if err:
+                errors.append(("Employee Check-In", err))
+
+            err = _validate_manager_checkin(mgr_file, df_mgr)
+            if err:
+                errors.append(("Manager Check-In", err))
+
+            # Validate Mena Report — pass the file object when uploaded so the
+            # year-in-filename check inside _validate_mena_report is applied.
+            err = _validate_mena_report(mena_upload if mena_upload else _mena_source, df_mena)
+            if err:
+                errors.append(("Mena Report", err))
+
+            # ── 3. Year consistency ───────────────────────────────────
+            err = _validate_year_consistency(df_emp, df_mgr)
+            if err:
+                errors.append(("Year Consistency", err))
+
+            # ── 4. Empty-file check ───────────────────────────────────
+            if df_emp.empty:
+                errors.append(("Employee Check-In", "File appears empty or unreadable."))
+            if df_mgr.empty:
+                errors.append(("Manager Check-In", "File appears empty or unreadable."))
+
+            # ── 5. Show all errors or proceed ─────────────────────────
+            if errors:
+                _show_validation_errors(errors)
+            else:
+                try:
                     cleaner = CheckInExcelCleaner()
                     cleaned_emp = cleaner.clean_employee_checkin(df_emp, df_mena)
                     cleaned_mgr = cleaner.clean_manager_checkin(df_mgr, df_mena, df_emp_cleaned=cleaned_emp)
@@ -364,12 +670,12 @@ if section == "KPIs":
                     st.session_state.cleaned_mgr = cleaned_mgr
                     st.session_state.combined = combined
                     st.session_state.clean_ready = True
+                except Exception as exc:
+                    _show_validation_errors([("Processing", f"Cleaning failed: {exc}")])
 
     # -------------------------
     # Feedback after clicking Run Cleaning
     # -------------------------
-    if st.session_state.clean_error:
-        st.error(st.session_state.clean_error)
 
     if st.session_state.clean_ready and st.session_state.cleaned_emp is not None and st.session_state.cleaned_mgr is not None:
         st.caption(f"Employee rows: {len(st.session_state.cleaned_emp)} | Manager rows: {len(st.session_state.cleaned_mgr)}")
@@ -1004,55 +1310,37 @@ if section == "KPIs":
             with st.expander("Company Resources", expanded=False):
 
                 # Show the question text
-                st.markdown("""
-                <b>Q: What company resources or practices do I use to ease and facilitate my experience within the work culture?</b><br>
-                <ul style='margin-top:0;margin-bottom:0;'>
-                  <li>Enrolling in the group's wellness sessions (yoga, fitness, workshops, ...)</li>
-                  <li>Seeking advice from HR (pulse check, one-on-one meetings, discussions, informal/formal requests, ...)</li>
-                  <li>Expressing complaints or miscellaneous ideas (anonymous reporting, open door policy, ...)</li>
-                  <li>Other</li>
-                </ul>
-                """, unsafe_allow_html=True)
+                st.markdown(
+                    "<b>Q: What company resources or practices do I use to ease and facilitate "
+                    "my experience within the work culture?</b>",
+                    unsafe_allow_html=True,
+                )
 
                 res_col = _find_company_resources_col_emp(emp_f)
-                other_text_col = _find_resources_other_text_col_emp(emp_f)
-                name_col = _find_your_name_col(emp_f)
 
                 if not res_col:
                     st.info("Could not detect the Company Resources question column in employee data.")
-                elif not name_col or name_col not in emp_f.columns:
-                    st.info("Employee name column not found in employee data.")
                 else:
                     counts = {k: 0 for k in RES_ORDER}
-                    other_entries = []
+                    other_details: list[str] = []   # track raw text for "Other"
 
                     for _, r in emp_f.iterrows():
-                        emp_name = str(r.get(name_col, "")).strip()
-                        picks = _split_multiselect(r.get(res_col, ""))
-                        norm_picks = []
+                        raw = r.get(res_col, "")
+                        picks = _split_multiselect(raw)
                         for p in picks:
                             k = _norm_resource_opt(p)
-                            if k:
-                                norm_picks.append(k)
-                        for k in norm_picks:
-                            counts[k] += 1
-                        if "Other" in norm_picks and emp_name and other_text_col and other_text_col in emp_f.columns:
-                            txt = str(r.get(other_text_col, "")).strip()
-                            if txt:
-                                other_entries.append(f'{emp_name}: "{txt}"')
+                            if k is None:
+                                continue
+                            counts[k] = counts.get(k, 0) + 1
+                            # Collect raw text for freeform "Other" entries
+                            if k == "Other":
+                                other_details.append(p.strip())
 
-                    # Display counts as a table
+                    # Build table
                     rows = []
-                    label_map = {
-                        "Enrolling in the group's wellness sessions": "Enrolling in the group's wellness sessions",
-                        "Seeking advice from HR": "Seeking advice from HR",
-                        "Expressing complaints or miscellaneous ideas": "Expressing complaints or miscellaneous ideas",
-                        "Other": "Other",
-                        "Not Applicable": "Not Applicable",
-                    }
                     for key in RES_ORDER:
-                        if key in counts:
-                            rows.append({"Company Resource": label_map.get(key, key), "Count": counts[key]})
+                        cnt = counts.get(key, 0)
+                        rows.append({"Option": key, "Count": cnt})
 
                     if rows:
                         df_resources = pd.DataFrame(rows)
@@ -1060,12 +1348,12 @@ if section == "KPIs":
                     else:
                         st.caption("No responses found for Company Resources.")
 
-                    # Other section
-                    if other_entries:
+                    # Show what the "Other" freeform answers were
+                    if other_details:
                         divider()
-                        st.subheader("Other")
-                        for x in other_entries:
-                            st.write(x)
+                        st.markdown("**Other responses:**")
+                        for txt in other_details:
+                            st.write(f"• {txt}")
 
                 
 
@@ -1919,6 +2207,387 @@ if section == "KPIs":
                         st.caption(f"{mgr_pct:.0f}%")
 
 
+    # =====================================================
+    # KPI SUB-SECTION: NLP – Open-Ended Answer Analysis
+    # =====================================================
+    if _show_nlp:
+        divider()
+        section_title("NLP – Open-Ended Answer Analysis")
+
+        st.markdown(
+            "Analyze open-ended check-in answers using AI. "
+            "Uses the Employee Check-In already uploaded above."
+        )
+
+        # ── Token check ──────────────────────────────────────
+        _gh_token = os.environ.get("GITHUB_MODELS_TOKEN", "")
+        if not _gh_token:
+            st.error(
+                "**GITHUB_MODELS_TOKEN** environment variable is not set.\n\n"
+                "To use NLP analysis:\n"
+                "1. Create a **fine-grained GitHub PAT** with the `models:read` permission.\n"
+                "2. Set it as an environment variable before launching Streamlit:\n\n"
+                "```\n"
+                "$env:GITHUB_MODELS_TOKEN = 'ghp_your_token_here'\n"
+                "streamlit run Home.py\n"
+                "```"
+            )
+        elif not st.session_state.clean_ready or st.session_state.cleaned_emp is None:
+            st.info(
+                "Upload and clean Employee Check-In data above first, "
+                "then the NLP section will become active."
+            )
+        else:
+            nlp_df = st.session_state.cleaned_emp.copy()
+            nlp_source = "Cleaned Employee Check-In"
+            st.caption(f"Data source: **{nlp_source}** ({len(nlp_df)} rows)")
+
+            # ── Detect available question pairs ─────────────
+            from hr_analytics.services.nlp_analyzer import NLPAnalyzer, _find_pair_columns
+            from hr_analytics.services.nlp_schema import BUILTIN_PAIRS
+
+            available_pairs: list[tuple] = []
+            for _pair in BUILTIN_PAIRS:
+                _q1c, _q2c = _find_pair_columns(nlp_df, _pair)
+                if _q2c is not None:
+                    available_pairs.append((_pair, _q1c, _q2c))
+
+            if not available_pairs:
+                st.warning(
+                    "No matching open-ended question columns found in this file. "
+                    "The NLP module looks for specific question pairs. "
+                    "Ensure your file contains the expected question headers."
+                )
+            else:
+                # ── Department filter ───────────────────────
+                _nlp_dept_col = None
+                for _c in nlp_df.columns:
+                    if "company" in _norm(_c) and "department" in _norm(_c):
+                        _nlp_dept_col = _c
+                        break
+                if _nlp_dept_col:
+                    dept_vals = sorted(nlp_df[_nlp_dept_col].dropna().unique())
+                    nlp_dept_filter = st.multiselect(
+                        "Filter by department (optional)",
+                        options=dept_vals,
+                        default=[],
+                        key="nlp_dept_filter",
+                    )
+                    if nlp_dept_filter:
+                        nlp_df = nlp_df[nlp_df[_nlp_dept_col].isin(nlp_dept_filter)].copy()
+                        st.caption(f"Filtered to {len(nlp_df)} rows")
+
+                # ── Question selector (by question_id) ──────
+                _qid_options: dict[str, str] = {}
+                for _p, _q1c, _q2c in available_pairs:
+                    _label = _p.q2_label
+                    if _p.q1_label:
+                        _label += f"  ← {_p.q1_label}"
+                    _qid_options[_label] = _p.question_id
+
+                selected_labels = st.multiselect(
+                    "Select open-ended question(s) to analyze",
+                    options=list(_qid_options.keys()),
+                    default=list(_qid_options.keys()),
+                    key="nlp_question_select",
+                )
+                selected_qids = [_qid_options[lbl] for lbl in selected_labels]
+
+                # Show detected columns for transparency
+                with st.expander("Detected columns", expanded=False):
+                    for _p, _q1c, _q2c in available_pairs:
+                        if _p.question_id in selected_qids:
+                            st.markdown(f"**{_p.q2_label}** (`{_p.question_id}`)")
+                            if _p.q1_label:
+                                st.caption(f"Closed (Q1): `{_q1c or 'not found'}`")
+                            st.caption(f"Open (Q2): `{_q2c}`")
+                            if _p.q1_trigger:
+                                st.caption(f"Conditional: Q1 {_p.q1_trigger}")
+
+                    _found_qids = {_p.question_id for _p, _, _ in available_pairs}
+                    _missing = [p for p in BUILTIN_PAIRS if p.question_id not in _found_qids]
+                    if _missing:
+                        st.markdown("---")
+                        st.markdown("**Not found in this file:**")
+                        for _m in _missing:
+                            st.caption(f"• {_m.q2_label} (`{_m.question_id}`)")
+
+                # ── Run button ──────────────────────────────
+                run_nlp = st.button(
+                    "Run NLP Analysis", type="primary",
+                    use_container_width=True, key="run_nlp_btn",
+                )
+
+                if run_nlp and selected_qids:
+                    st.session_state.nlp_results = None
+                    st.session_state.nlp_error = None
+
+                    progress_bar = st.progress(0, text="Analyzing…")
+
+                    def _update_progress(current: int, total: int):
+                        pct = current / max(total, 1)
+                        progress_bar.progress(
+                            pct, text=f"Processed {current}/{total} records"
+                        )
+
+                    try:
+                        analyzer = NLPAnalyzer(
+                            token=_gh_token,
+                            cache=st.session_state.nlp_cache,
+                        )
+                        result_df = analyzer.analyze(
+                            nlp_df,
+                            question_ids=selected_qids,
+                            progress_callback=_update_progress,
+                        )
+                        st.session_state.nlp_results = result_df
+                        progress_bar.progress(1.0, text="Done!")
+                    except Exception as exc:
+                        st.session_state.nlp_error = str(exc)
+                        st.error(f"NLP analysis failed: {exc}")
+
+                # ── Display results ─────────────────────────
+                if st.session_state.nlp_error:
+                    st.error(f"Last run failed: {st.session_state.nlp_error}")
+
+                if (
+                    st.session_state.nlp_results is not None
+                    and not st.session_state.nlp_results.empty
+                ):
+                    res = st.session_state.nlp_results
+                    divider()
+
+                    # ── Summary KPIs ────────────────────────
+                    section_title("Summary")
+                    _col_a, _col_b, _col_c, _col_d = st.columns(4)
+                    _non_ans = int(res["is_non_answer"].sum()) if "is_non_answer" in res.columns else 0
+                    _substantive = len(res) - _non_ans
+                    _unique_q = res["question_id"].nunique() if "question_id" in res.columns else 0
+                    with _col_a:
+                        st.metric("Total records", len(res))
+                    with _col_b:
+                        st.metric("Substantive", _substantive)
+                    with _col_c:
+                        st.metric("Non-answers", _non_ans)
+                    with _col_d:
+                        st.metric("Questions analysed", _unique_q)
+
+                    # Filter to substantive answers only for all charts below
+                    subs = res[~res["is_non_answer"]] if "is_non_answer" in res.columns else res
+
+                    # ── Sentiment distribution ──────────────
+                    if "sentiment_label" in subs.columns and not subs.empty:
+                        divider()
+                        section_title("Sentiment Distribution")
+                        sent_counts = subs["sentiment_label"].value_counts()
+                        _cs1, _cs2 = st.columns([1, 2])
+                        with _cs1:
+                            st.dataframe(
+                                sent_counts.rename("Count"),
+                                use_container_width=True,
+                            )
+                        with _cs2:
+                            _fig_s, _ax_s = plt.subplots(figsize=(4, 3))
+                            _sent_colors = {
+                                "positive": "#4CAF50",
+                                "neutral": "#FFC107",
+                                "negative": "#E53935",
+                            }
+                            _bar_c = [_sent_colors.get(l, "#999") for l in sent_counts.index]
+                            _ax_s.bar(sent_counts.index, sent_counts.values, color=_bar_c)
+                            _ax_s.set_ylabel("Count")
+                            _ax_s.set_title("Sentiment")
+                            st.pyplot(_fig_s)
+                            plt.close(_fig_s)
+
+                    # ── Theme distribution ──────────────────
+                    if "themes" in subs.columns and not subs.empty:
+                        divider()
+                        section_title("Theme Distribution")
+                        _theme_lists = subs["themes"].dropna().apply(
+                            lambda ts: [t["label"] for t in ts] if ts else []
+                        )
+                        _all_themes = [l for sub in _theme_lists for l in sub]
+                        if _all_themes:
+                            _tdf = (
+                                pd.Series(_all_themes)
+                                .value_counts()
+                                .rename_axis("Theme")
+                                .reset_index(name="Count")
+                            )
+                            _ct1, _ct2 = st.columns([1, 2])
+                            with _ct1:
+                                st.dataframe(_tdf, use_container_width=True, hide_index=True)
+                            with _ct2:
+                                _fig_t, _ax_t = plt.subplots(
+                                    figsize=(5, max(3, len(_tdf) * 0.4))
+                                )
+                                _ax_t.barh(_tdf["Theme"], _tdf["Count"], color="#1976D2")
+                                _ax_t.set_xlabel("Count")
+                                _ax_t.set_title("Themes")
+                                _ax_t.invert_yaxis()
+                                _fig_t.tight_layout()
+                                st.pyplot(_fig_t)
+                                plt.close(_fig_t)
+
+                    # ── Severity distribution ───────────────
+                    if "severity" in subs.columns and not subs.empty:
+                        divider()
+                        section_title("Severity Distribution")
+                        _sev_c = subs["severity"].value_counts().sort_index()
+                        _sev_map = {0: "None (0)", 1: "Low (1)", 2: "Medium (2)", 3: "High (3)"}
+                        st.dataframe(
+                            _sev_c.rename(index=_sev_map).rename("Count"),
+                            use_container_width=True,
+                        )
+
+                    # ── Top 5 issues by severity × count ────
+                    if "severity" in subs.columns and "themes" in subs.columns and not subs.empty:
+                        divider()
+                        section_title("Top 5 Issues (Severity × Count)")
+                        _expl = subs.explode("themes").dropna(subset=["themes"])
+                        if not _expl.empty:
+                            _expl["_tlbl"] = _expl["themes"].apply(
+                                lambda t: t["label"] if isinstance(t, dict) else ""
+                            )
+                            _agg = (
+                                _expl.groupby("_tlbl")
+                                .agg(count=("_tlbl", "size"), avg_severity=("severity", "mean"))
+                                .reset_index()
+                            )
+                            _agg["score"] = _agg["count"] * _agg["avg_severity"]
+                            _top5 = _agg.sort_values("score", ascending=False).head(5)
+                            st.dataframe(
+                                _top5.rename(columns={
+                                    "_tlbl": "Theme", "count": "Count",
+                                    "avg_severity": "Avg Severity", "score": "Score",
+                                }),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+
+                    # ── Breakdown by department ─────────────
+                    if "department" in subs.columns and "themes" in subs.columns and not subs.empty:
+                        divider()
+                        section_title("Top Issues by Department")
+                        _dt = subs.explode("themes").dropna(subset=["themes"])
+                        if not _dt.empty:
+                            _dt["_tlbl"] = _dt["themes"].apply(
+                                lambda t: t["label"] if isinstance(t, dict) else ""
+                            )
+                            _piv = (
+                                _dt.groupby(["department", "_tlbl"])
+                                .size()
+                                .reset_index(name="Count")
+                            )
+                            _piv = _piv.sort_values(
+                                ["department", "Count"], ascending=[True, False]
+                            )
+                            _top3_dept = _piv.groupby("department").head(3)
+                            st.dataframe(
+                                _top3_dept.rename(columns={
+                                    "_tlbl": "Theme", "department": "Department",
+                                }),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+
+                    # ── Breakdown by manager ────────────────
+                    if "manager_name" in subs.columns and "themes" in subs.columns and not subs.empty:
+                        _mgr_vals = subs["manager_name"].dropna().unique()
+                        if len(_mgr_vals) > 0:
+                            divider()
+                            section_title("Top Issues by Manager")
+                            _mt = subs.explode("themes").dropna(subset=["themes"])
+                            if not _mt.empty:
+                                _mt["_tlbl"] = _mt["themes"].apply(
+                                    lambda t: t["label"] if isinstance(t, dict) else ""
+                                )
+                                _mpiv = (
+                                    _mt.groupby(["manager_name", "_tlbl"])
+                                    .size()
+                                    .reset_index(name="Count")
+                                )
+                                _mpiv = _mpiv.sort_values(
+                                    ["manager_name", "Count"], ascending=[True, False]
+                                )
+                                _top3_mgr = _mpiv.groupby("manager_name").head(3)
+                                st.dataframe(
+                                    _top3_mgr.rename(columns={
+                                        "_tlbl": "Theme", "manager_name": "Manager",
+                                    }),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+
+                    # ── Detailed results table ──────────────
+                    divider()
+                    section_title("Detailed Results")
+                    _detail_cols = [
+                        c for c in [
+                            "employee_id", "employee_name", "question_id",
+                            "pair_id", "department", "manager_name", "year",
+                            "q1_question", "q1_answer",
+                            "q2_question", "q2_answer_raw",
+                            "language", "is_non_answer",
+                            "themes_display", "sentiment_label",
+                            "sentiment_score", "severity", "actionability",
+                            "summary", "recommendation",
+                        ] if c in res.columns
+                    ]
+                    st.dataframe(
+                        res[_detail_cols], use_container_width=True, hide_index=True,
+                    )
+
+                    # ── Downloads ───────────────────────────
+                    divider()
+                    section_title("Download")
+                    _dl1, _dl2 = st.columns(2)
+                    with _dl1:
+                        _csv = res[_detail_cols].to_csv(index=False).encode("utf-8")
+                        st.download_button(
+                            label="⬇️ Download CSV",
+                            data=_csv,
+                            file_name="nlp_results.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                            key="nlp_dl_csv",
+                        )
+                    with _dl2:
+                        _buf = io.BytesIO()
+                        res[_detail_cols].to_excel(_buf, index=False, engine="openpyxl")
+                        _buf.seek(0)
+                        st.download_button(
+                            label="⬇️ Download Excel",
+                            data=_buf,
+                            file_name="nlp_results.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            key="nlp_dl_xlsx",
+                        )
+
+                    # ── Audit sample ────────────────────────
+                    divider()
+                    section_title("Audit Sample")
+                    _max_n = min(50, len(res))
+                    _n = st.slider(
+                        "Rows to show", min_value=1, max_value=_max_n,
+                        value=min(5, _max_n), key="nlp_audit_n",
+                    )
+                    _sample = res.sample(n=_n, random_state=42) if len(res) >= _n else res
+                    _audit_cols = [
+                        c for c in [
+                            "employee_id", "department", "question_id",
+                            "q1_answer", "q2_answer_raw",
+                            "themes_display", "sentiment_label", "severity",
+                            "actionability", "summary", "recommendation",
+                        ] if c in _sample.columns
+                    ]
+                    st.dataframe(
+                        _sample[_audit_cols], use_container_width=True, hide_index=True,
+                    )
+
+
 # -------------------------
 # SECTION: Compare 2 Years
 # -------------------------
@@ -1928,39 +2597,42 @@ elif section == "Compare":
 
     with st.expander("Upload", expanded=not st.session_state.yoy_ready):
 
-        # Mena Report uploader for comparison
-        st.file_uploader(
-            "Mena Report",
-            type=["xlsx", "xls", "csv"],
-            key="compare_mena_upload",
-        )
-
         col1, col2 = st.columns(2)
 
         with col1:
-            st.subheader("Year 1 (Earlier)")
+            st.subheader("Baseline Period")
             st.file_uploader(
-                "Employee Check-In (Year 1)",
+                "Employee Check-In (Baseline)",
                 type=["xlsx", "xls", "csv"],
                 key="compare_emp_y1",
             )
             st.file_uploader(
-                "Manager Check-In (Year 1)",
+                "Manager Check-In (Baseline)",
                 type=["xlsx", "xls", "csv"],
                 key="compare_mgr_y1",
             )
+            st.file_uploader(
+                "Mena Report (Baseline)",
+                type=["xlsx", "xls", "csv"],
+                key="compare_mena_y1",
+            )
 
         with col2:
-            st.subheader("Year 2 (Later)")
+            st.subheader("Comparison Period")
             st.file_uploader(
-                "Employee Check-In (Year 2)",
+                "Employee Check-In (Comparison)",
                 type=["xlsx", "xls", "csv"],
                 key="compare_emp_y2",
             )
             st.file_uploader(
-                "Manager Check-In (Year 2)",
+                "Manager Check-In (Comparison)",
                 type=["xlsx", "xls", "csv"],
                 key="compare_mgr_y2",
+            )
+            st.file_uploader(
+                "Mena Report (Comparison)",
+                type=["xlsx", "xls", "csv"],
+                key="compare_mena_y2",
             )
 
         # Department filter for comparison
@@ -1994,7 +2666,7 @@ elif section == "Compare":
         _run_comparison()
 
     if not st.session_state.yoy_ready:
-        st.info("Upload the 4 check-in files above and click **Run Comparison**.")
+        st.info("Upload the check-in files and their corresponding Mena Reports above, then click **Run Comparison**.")
 
     if st.session_state.yoy_ready and st.session_state.yoy_payload:
         y1 = st.session_state.yoy_payload["y1"]
@@ -2384,19 +3056,21 @@ elif section == "Compare":
                 # At Risk comparison
                 with st.expander("⚠️ At Risk of Low Performance", expanded=True):
                     col1, col2 = st.columns(2)
+                    _sub_col_y1 = _find_subordinate_name_col(risk_df_y1) if not risk_df_y1.empty else None
+                    _sub_col_y2 = _find_subordinate_name_col(risk_df_y2) if not risk_df_y2.empty else None
                     
                     with col1:
                         st.subheader(f"{y1}")
                         st.metric("Employees at risk", len(risk_df_y1))
-                        if not risk_df_y1.empty:
-                            st.dataframe(risk_df_y1[["Subordinate Name"]].head(10), use_container_width=True, hide_index=True)
+                        if not risk_df_y1.empty and _sub_col_y1:
+                            st.dataframe(risk_df_y1[[_sub_col_y1]].head(10), use_container_width=True, hide_index=True)
                     
                     with col2:
                         st.subheader(f"{y2}")
                         delta = len(risk_df_y2) - len(risk_df_y1)
                         st.metric("Employees at risk", len(risk_df_y2), delta=delta, delta_color="inverse")
-                        if not risk_df_y2.empty:
-                            st.dataframe(risk_df_y2[["Subordinate Name"]].head(10), use_container_width=True, hide_index=True)
+                        if not risk_df_y2.empty and _sub_col_y2:
+                            st.dataframe(risk_df_y2[[_sub_col_y2]].head(10), use_container_width=True, hide_index=True)
                 
                 # Manager Stress
                 with st.expander("😰 Manager Stress about Employees", expanded=False):
