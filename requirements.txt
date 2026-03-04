@@ -4,3 +4,5 @@ streamlit
 numpy
 matplotlib
 xlrd>=2.0.1
+pydantic
+requests

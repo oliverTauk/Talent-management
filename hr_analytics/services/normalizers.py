@@ -161,15 +161,29 @@ def _norm_behavior_opt(opt: str) -> str:
 STRESS_FREQ_ORDER = ["Extremely frequent", "Frequent", "Less frequent"]
 
 
-def _norm_stress_freq(x: str) -> str:
-    s = _norm(x)
-    if "less" in s and "frequent" in s:
-        return "Less frequent"
-    if s.startswith("frequent") or ("frequent" in s and "extreme" not in s):
-        return "Frequent"
+def _norm_stress_freq(x) -> str | None:
+    """Normalise a stress-frequency survey response.
+
+    Returns one of 'Extremely frequent', 'Frequent', 'Less frequent', or None.
+    None is returned for missing / unrecognised values so they are silently
+    excluded from charts rather than appearing as an 'Unknown' bar.
+    """
+    if x is None:
+        return None
+    raw = str(x).strip()
+    if raw == "" or raw.lower() in ("nan", "none"):
+        return None
+    s = _norm(raw)
     if "extreme" in s and "frequent" in s:
         return "Extremely frequent"
-    return "Unknown"
+    if "less" in s and "frequent" in s:
+        return "Less frequent"
+    if "frequent" in s:
+        return "Frequent"
+    # Semantically not-stressed options
+    if s in ("never", "rarely", "sometimes"):
+        return "Less frequent"
+    return None
 
 
 STRESS_REASON_ORDER = [
@@ -510,19 +524,22 @@ RES_ORDER = [
 
 def _norm_resource_opt(x: str) -> str | None:
     s = _norm(x)
+    if not s or s in ("-", "nan"):
+        return None  # truly blank — skip
 
-    if "wellness" in s or ("group" in s and "wellness" in s):
+    if "wellness" in s or ("group" in s and "session" in s):
         return "Enrolling in the group's wellness sessions"
-    if "seeking" in s and "advice" in s and "hr" in s:
+    if ("seeking" in s and "hr" in s) or ("advice" in s and "hr" in s) or ("pulse" in s):
         return "Seeking advice from HR"
-    if "complaint" in s or ("miscellaneous" in s and "idea" in s):
+    if "complaint" in s or ("miscellaneous" in s and "idea" in s) or "anonymous" in s or "open door" in s:
         return "Expressing complaints or miscellaneous ideas"
-    if "not applicable" in s:
+    # Treat explicit "none" / "not applicable" / "n/a" answers as N/A
+    if s in ("none", "n/a", "na") or "not applicable" in s or "used none" in s:
         return "Not Applicable"
     if "other" in s:
         return "Other"
-
-    return None
+    # Anything that doesn't match a known option → Other
+    return "Other"
 
 
 # ============================================================
@@ -764,8 +781,12 @@ def _metrics(emp_df: pd.DataFrame, mgr_df: pd.DataFrame) -> dict:
 # Percentage formatting helper
 # ============================================================
 
-def _pct(x: float) -> str:
+def _pct(x) -> str:
+    """Format a 0..1 float as a percentage string.  Returns 'N/A' for None / NaN."""
     try:
-        return f"{float(x) * 100:.1f}%"
+        v = float(x)
+        if v != v:          # NaN check (NaN != NaN is True)
+            return "N/A"
+        return f"{v * 100:.1f}%"
     except Exception:
-        return "0.0%"
+        return "N/A"
