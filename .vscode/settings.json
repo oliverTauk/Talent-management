@@ -1,0 +1,8 @@
+{
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "python-envs.pythonProjects": [],
+    "python.defaultInterpreterPath": "c:\\Users\\OliverTauk\\AppData\\Local\\miniconda3\\envs\\itg\\python.exe",
+    "python.terminal.activateEnvironment": true,
+    "python.condaPath": "C:\\Users\\OliverTauk\\AppData\\Local\\miniconda3\\condabin\\conda.bat"
+}

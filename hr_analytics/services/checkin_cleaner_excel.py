@@ -2,6 +2,107 @@ from __future__ import annotations
 import pandas as pd
 
 
+# ============================================================
+# Fuzzy name-matching helpers (module-level for reuse)
+# ============================================================
+
+def _token_fuzzy_match(tok_a: str, tok_b: str) -> bool:
+    """Return True if two tokens are 'close enough'.
+
+    Handles Arabic-name transliteration variants like
+    Kaissi/Kaissy, Mohamad/Mohammad, Mohamed/Mohammad, etc.
+    Rules:
+      1. Exact match → True
+      2. Shared prefix ≥ 4 chars → True
+      3. Edit-distance ≤ 2 (for tokens ≥ 4 chars) → True
+    """
+    if tok_a == tok_b:
+        return True
+    # Shared-prefix heuristic (very cheap)
+    prefix_len = min(len(tok_a), len(tok_b), 4)
+    if prefix_len >= 4 and tok_a[:prefix_len] == tok_b[:prefix_len]:
+        return True
+    # Levenshtein with early exit (max distance 2)
+    if min(len(tok_a), len(tok_b)) < 4:
+        return False
+    if abs(len(tok_a) - len(tok_b)) > 2:
+        return False
+    la, lb = len(tok_a), len(tok_b)
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        curr = [i] + [0] * lb
+        for j in range(1, lb + 1):
+            cost = 0 if tok_a[i - 1] == tok_b[j - 1] else 1
+            curr[j] = min(
+                prev[j] + 1,       # delete
+                curr[j - 1] + 1,   # insert
+                prev[j - 1] + cost, # substitute
+            )
+        prev = curr
+    return prev[lb] <= 2
+
+
+def _tokens_fuzzy_subset(raw_toks: list[str],
+                         canon_toks: list[str]) -> bool:
+    """Return True if every raw token fuzzy-matches at least one
+    (distinct) canonical token."""
+    remaining = list(canon_toks)
+    for rt in raw_toks:
+        found = False
+        for i, ct in enumerate(remaining):
+            if _token_fuzzy_match(rt, ct):
+                remaining.pop(i)
+                found = True
+                break
+        if not found:
+            return False
+    return True
+
+
+def _build_fuzzy_manager_resolver(
+    canonical_mgrs: list[str],
+) -> 'callable':
+    """Return a function that maps any raw manager name string to
+    the best-matching canonical manager name (or returns it as-is).
+    """
+    exact_lookup: dict[str, str] = {m.lower(): m for m in canonical_mgrs}
+    token_lookup: list[tuple[list[str], str]] = [
+        (m.lower().split(), m) for m in canonical_mgrs
+    ]
+
+    def resolve(raw: str) -> str:
+        if not raw or str(raw).lower() in ('nan', 'none', ''):
+            return raw
+        raw_stripped = str(raw).strip()
+        key = raw_stripped.lower()
+        # 1) Exact (case-insensitive)
+        if key in exact_lookup:
+            return exact_lookup[key]
+        raw_toks = key.split()
+        if not raw_toks:
+            return raw_stripped
+        # 2) Fuzzy token-subset: raw tokens ⊆ canonical tokens
+        best: str | None = None
+        best_extra = float('inf')
+        for canon_toks, canon_name in token_lookup:
+            if _tokens_fuzzy_subset(raw_toks, canon_toks):
+                extra = len(canon_toks) - len(raw_toks)
+                if extra < best_extra:
+                    best = canon_name
+                    best_extra = extra
+        if best is not None:
+            return best
+        # 3) Reverse: canonical tokens ⊆ raw tokens
+        for canon_toks, canon_name in token_lookup:
+            if _tokens_fuzzy_subset(canon_toks, raw_toks):
+                return canon_name
+        return raw_stripped
+
+    return resolve
+
+
+# ============================================================
+
 class CheckInExcelCleaner:
     """Clean Employee and Manager check-ins using Mena Report as authority.
 
@@ -186,6 +287,25 @@ class CheckInExcelCleaner:
             # Also drop the duplicate 'Employee Name' if it appeared from the merge
             if 'Employee Name' in out.columns and 'Mena Name' in out.columns:
                 out = out.drop(columns=['Employee Name'], errors='ignore')
+
+            # ── Global manager-name unification ──────────────────
+            # Mena is the authoritative source for names.
+            # Collect unique canonical names from Mena's Manager Name and
+            # Employee Name columns, then fuzzy-match every survey
+            # manager name against this canonical set.
+            canonical_names = set()
+            for col in ('Manager Name', 'Employee Name'):
+                if col in mena.columns:
+                    vals = mena[col].dropna().astype(str).str.strip()
+                    canonical_names.update(v for v in vals if v.lower() not in ('nan', 'none', ''))
+
+            if canonical_names:
+                _resolve = _build_fuzzy_manager_resolver(list(canonical_names))
+                out[mgr_col_in_checkin] = (
+                    out[mgr_col_in_checkin]
+                    .astype(str)
+                    .map(_resolve)
+                )
 
         return out
 
